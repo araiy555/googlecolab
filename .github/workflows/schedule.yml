@@ -1,0 +1,24 @@
+name: Daily Task
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 毎日UTC 0時（日本時間9時）
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Run script
+        run: python your_script.py
