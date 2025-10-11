@@ -2,7 +2,7 @@ name: Collect Market Indicators
 
 on:
   schedule:
-    - cron: '0 14 * * 1-5'  # 平日毎日 UTC 14時（日本時間23時）
+    - cron: '0 17 * * *'  # 毎日UTC 16時（日本時間翌日1時）
   workflow_dispatch:  # 手動実行も可能
 
 jobs:
