@@ -2,7 +2,7 @@ name: Kabutan Monthly Disclosures
 
 on:
   schedule:
-    - cron: '0 10 1 * *'  # 毎月1日 UTC 10時（日本時間19時）
+    - cron: '0 18 * * *'  # 毎日UTC 18時（日本時間翌日1時）
   workflow_dispatch:  # 手動実行も可能
 
 jobs:
