@@ -2,7 +2,7 @@ name: Organize Stock Disclosures
 
 on:
   schedule:
-    - cron: '0 12 2 * *'  # 毎月2日 UTC 12時（日本時間21時）
+    - cron: '0 19 * * *'  # 毎日UTC 18時（日本時間翌日1時）
   workflow_dispatch:  # 手動実行も可能
 
 jobs:
