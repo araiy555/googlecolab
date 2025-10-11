@@ -1,2 +1,2 @@
 
-echo 'test';X
+echo 'test';
