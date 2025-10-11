@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-株探5年分開示情報収集システム（月ごとS3保存版）
-https://kabutan.jp/disclosures/?kubun=&date=YYYYMM00 から月ごとデータ取得
+株探開示情報日次収集システム
+毎日当月と前月のデータを取得・更新（データ漏れ防止）
 """
 
 import requests
@@ -16,10 +16,10 @@ import random
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-class KabutanMonthlyCollector:
+class KabutanDailyCollector:
     def __init__(self):
-        """月ごと収集システム初期化"""
-        print("月ごと収集システム初期化中...")
+        """日次収集システム初期化"""
+        print("日次収集システム初期化中...")
 
         # 基本設定
         self.base_url = "https://kabutan.jp"
@@ -28,16 +28,15 @@ class KabutanMonthlyCollector:
         self.s3_prefix = "japan-stocks-5years-chart/monthly-disclosures/"
 
         # 高速取得設定
-        self.delay_base = 1.0  # 基本間隔1秒
-        self.delay_variance = 0.3  # ±0.3秒
-        self.retry_delay = 5.0  # リトライ間隔
-        self.max_retries = 3  # リトライ回数
-        self.max_consecutive_empty = 20  # 連続空ページ
+        self.delay_base = 1.0
+        self.delay_variance = 0.3
+        self.retry_delay = 5.0
+        self.max_retries = 3
+        self.max_consecutive_empty = 20
         self.session_reset_interval = 200
 
         # S3クライアント初期化
         self.s3 = self._init_s3_client()
-        self.existing_months = set()
 
         # セッション初期化
         self.session = None
@@ -48,9 +47,7 @@ class KabutanMonthlyCollector:
         self.stats = {
             'requests': 0,
             'success': 0,
-            'retries': 0,
             'total_disclosures': 0,
-            'skipped_months': 0,
             'start_time': None
         }
 
@@ -89,42 +86,29 @@ class KabutanMonthlyCollector:
         self.session.mount("https://", adapter)
 
         user_agents = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
         ]
 
         self.session.headers.update({
             'User-Agent': random.choice(user_agents),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
             'Accept-Language': 'ja,en-US;q=0.7,en;q=0.3',
             'Connection': 'keep-alive',
         })
 
-    def load_existing_months(self):
-        """既存の月データをチェック"""
+    def load_existing_month_data(self, year, month):
+        """既存の月データをS3から取得"""
         if not self.s3:
-            print("S3クライアントが利用できません")
-            return
+            return None
 
         try:
-            print("既存月データ確認中...")
-
-            paginator = self.s3.get_paginator('list_objects_v2')
-            pages = paginator.paginate(Bucket=self.bucket_name, Prefix=self.s3_prefix)
-
-            for page in pages:
-                if 'Contents' in page:
-                    for obj in page['Contents']:
-                        # ファイル名から年月を抽出 (例: 2024-01.json)
-                        filename = obj['Key'].split('/')[-1]
-                        if filename.endswith('.json') and len(filename) == 12:  # YYYY-MM.json
-                            year_month = filename[:-5]  # .json を除去
-                            self.existing_months.add(year_month)
-
-            print(f"既存月データ: {len(self.existing_months)}ヶ月")
-
-        except Exception as e:
-            print(f"既存データ確認エラー: {e}")
+            key = f"{self.s3_prefix}{year}-{month:02d}.json"
+            response = self.s3.get_object(Bucket=self.bucket_name, Key=key)
+            data = json.loads(response['Body'].read().decode('utf-8'))
+            return data
+        except:
+            return None
 
     def fetch_month_disclosures(self, year, month):
         """指定月の全開示情報を取得"""
@@ -138,21 +122,17 @@ class KabutanMonthlyCollector:
             consecutive_empty = 0
 
             while consecutive_empty < self.max_consecutive_empty:
-                # セッションリセット判定
                 if self.request_count >= self.session_reset_interval:
-                    print("  セッションリセット")
                     self._init_session()
                     self.request_count = 0
 
-                # URLパラメータ設定
                 url = f"{self.disclosure_url}?kubun=&date={date_param}&page={page}"
 
                 success = False
                 for retry in range(self.max_retries):
                     try:
-                        print(f"  ページ{page}", end='')
+                        print(f"  ページ{page}", end='', flush=True)
 
-                        # ランダム遅延
                         delay = self.delay_base + random.uniform(-self.delay_variance, self.delay_variance)
                         if retry > 0:
                             delay += self.retry_delay
@@ -167,23 +147,20 @@ class KabutanMonthlyCollector:
                             success = True
                             break
                         elif response.status_code == 429:
-                            print(" - レート制限")
+                            print(" - レート制限", flush=True)
                             time.sleep(10)
-                            self.stats['retries'] += 1
                         else:
-                            print(f" - HTTPエラー: {response.status_code}")
+                            print(f" - HTTPエラー: {response.status_code}", flush=True)
                             time.sleep(self.retry_delay)
-                            self.stats['retries'] += 1
 
                     except Exception as e:
-                        print(f" - エラー: {e}")
+                        print(f" - エラー: {e}", flush=True)
                         time.sleep(self.retry_delay)
-                        self.stats['retries'] += 1
 
                 if not success:
                     consecutive_empty += 1
                     page += 1
-                    print(" - 失敗")
+                    print(" - 失敗", flush=True)
                     continue
 
                 # HTML解析
@@ -193,14 +170,13 @@ class KabutanMonthlyCollector:
                 if page_disclosures:
                     consecutive_empty = 0
                     all_disclosures.extend(page_disclosures)
-                    print(f" - {len(page_disclosures)}件")
+                    print(f" - {len(page_disclosures)}件", flush=True)
                 else:
                     consecutive_empty += 1
-                    print(" - 0件")
+                    print(" - 0件", flush=True)
 
                 page += 1
 
-                # 上限チェック
                 if page > 1000:
                     print(f"  最大ページ数到達: {page-1}")
                     break
@@ -216,19 +192,16 @@ class KabutanMonthlyCollector:
         """ページから開示情報を抽出"""
         disclosures = []
 
-        # テーブルから開示情報を抽出
         tables = soup.find_all('table')
         for table in tables:
             rows = table.find_all('tr')
-
             for row in rows:
                 cells = row.find_all(['td', 'th'])
-                if len(cells) >= 3:  # 最低3列必要
+                if len(cells) >= 3:
                     row_data = self.parse_disclosure_row(cells, year, month)
                     if row_data:
                         disclosures.append(row_data)
 
-        # リストから開示情報を抽出（テーブル以外）
         disclosure_items = soup.find_all(['div', 'li'], class_=re.compile(r'disclosure|item|news'))
         for item in disclosure_items:
             item_data = self.parse_disclosure_item(item, year, month)
@@ -242,14 +215,12 @@ class KabutanMonthlyCollector:
         try:
             texts = [cell.get_text().strip() for cell in cells]
 
-            # 株式コードを検索
             stock_code = None
             date_info = None
             title = None
             company_name = None
 
             for i, text in enumerate(texts):
-                # 株式コード検索（4桁数字）
                 if not stock_code:
                     codes = re.findall(r'\b(\d{4})\b', text)
                     for code in codes:
@@ -257,14 +228,12 @@ class KabutanMonthlyCollector:
                             stock_code = code
                             break
 
-                # 日付情報検索
                 if not date_info:
                     date_matches = re.findall(r'(\d{1,2})/(\d{1,2})', text)
                     if date_matches:
                         month_day = date_matches[0]
                         date_info = f"{year}-{month:02d}-{int(month_day[1]):02d}"
 
-                # 会社名とタイトル
                 if len(text) > 5 and not re.match(r'^\d+$', text):
                     if not company_name and stock_code:
                         company_name = text
@@ -293,7 +262,6 @@ class KabutanMonthlyCollector:
         try:
             text = item.get_text().strip()
 
-            # 株式コード検索
             codes = re.findall(r'\b(\d{4})\b', text)
             stock_code = None
             for code in codes:
@@ -320,8 +288,6 @@ class KabutanMonthlyCollector:
 
     def categorize_disclosure(self, title):
         """開示情報のカテゴリ分類"""
-        title_lower = title.lower()
-
         if any(word in title for word in ['決算', '業績', '四半期', '売上', '利益']):
             return '決算・業績'
         elif any(word in title for word in ['配当', '株主優待', '自己株式']):
@@ -342,7 +308,6 @@ class KabutanMonthlyCollector:
             return False
 
         try:
-            # データ構造
             month_data = {
                 'year': year,
                 'month': month,
@@ -353,7 +318,6 @@ class KabutanMonthlyCollector:
                 'updated_at': datetime.now().isoformat()
             }
 
-            # カテゴリ別集計
             for disclosure in disclosures:
                 category = disclosure.get('category', 'その他')
                 month_data['categories'][category] = month_data['categories'].get(category, 0) + 1
@@ -361,7 +325,6 @@ class KabutanMonthlyCollector:
                 company = disclosure.get('company_name', '不明')
                 month_data['companies'][company] = month_data['companies'].get(company, 0) + 1
 
-            # S3に保存
             key = f"{self.s3_prefix}{year}-{month:02d}.json"
 
             self.s3.put_object(
@@ -378,101 +341,84 @@ class KabutanMonthlyCollector:
             print(f"S3保存エラー: {e}")
             return False
 
-    def run_five_year_monthly_collection(self):
-        """5年分月ごとデータ収集実行"""
+    def get_target_months(self):
+        """対象月を取得（当月と前月）"""
+        today = datetime.now()
+        current_year = today.year
+        current_month = today.month
+
+        months = []
+
+        # 前月
+        if current_month == 1:
+            prev_year = current_year - 1
+            prev_month = 12
+        else:
+            prev_year = current_year
+            prev_month = current_month - 1
+
+        months.append((prev_year, prev_month))
+
+        # 当月
+        months.append((current_year, current_month))
+
+        return months
+
+    def run_daily_collection(self):
+        """日次収集実行（当月と前月）"""
         print("=" * 60)
-        print("株探5年分月ごと開示情報収集開始")
+        print("株探日次開示情報収集開始")
         print("=" * 60)
 
         self.stats['start_time'] = time.time()
 
-        # 既存データチェック
-        self.load_existing_months()
-
-        # 5年分の月リスト生成（2020年1月〜2025年9月）
-        current = datetime.now()
-        months = []
-
-        for year in range(2020, current.year + 1):
-            start_month = 1
-            end_month = 12
-            if year == current.year:
-                end_month = current.month
-
-            for month in range(start_month, end_month + 1):
-                months.append((year, month))
-
-        print(f"対象期間: {months[0][0]}年{months[0][1]}月 ～ {months[-1][0]}年{months[-1][1]}月")
-        print(f"総月数: {len(months)}ヶ月")
+        # 対象月を取得
+        target_months = self.get_target_months()
+        print(f"対象月: {target_months[0][0]}年{target_months[0][1]}月 と {target_months[1][0]}年{target_months[1][1]}月")
         print("=" * 60)
 
-        # 月ごとデータ収集
-        for i, (year, month) in enumerate(months):
-            try:
-                print(f"\n[{i+1}/{len(months)}] {year}年{month}月")
+        total_new = 0
 
-                # スキップ判定
-                year_month_key = f"{year}-{month:02d}"
-                if year_month_key in self.existing_months:
-                    print("  → スキップ（既存データあり）")
-                    self.stats['skipped_months'] += 1
-                    continue
+        try:
+            for year, month in target_months:
+                print(f"\n処理: {year}年{month}月")
 
-                # 月データ取得
-                disclosures = self.fetch_month_disclosures(year, month)
+                # 既存データを取得
+                existing_data = self.load_existing_month_data(year, month)
+                existing_count = len(existing_data.get('disclosures', [])) if existing_data else 0
 
-                if disclosures:
-                    # S3保存
-                    if self.save_month_to_s3(year, month, disclosures):
-                        self.stats['total_disclosures'] += len(disclosures)
+                # 最新データを取得
+                new_disclosures = self.fetch_month_disclosures(year, month)
 
-                # 進捗表示
-                elapsed = time.time() - self.stats['start_time']
-                progress = (i + 1) / len(months) * 100
+                if new_disclosures:
+                    # S3に保存
+                    if self.save_month_to_s3(year, month, new_disclosures):
+                        new_count = len(new_disclosures)
+                        diff = new_count - existing_count
+                        total_new += new_count
+                        print(f"  結果: {new_count}件 (前回比: {diff:+d}件)")
+                else:
+                    print(f"  結果: 0件")
 
-                print(f"  進捗: {i+1}/{len(months)} ({progress:.1f}%)")
-                print(f"  月次開示: {len(disclosures)}件")
-                print(f"  累計開示: {self.stats['total_disclosures']:,}件")
-                print(f"  スキップ: {self.stats['skipped_months']}月")
-                print(f"  経過時間: {elapsed/3600:.1f}時間")
+            # 完了レポート
+            elapsed = time.time() - self.stats['start_time']
+            print("\n" + "=" * 60)
+            print("収集完了")
+            print(f"総開示件数: {total_new}件")
+            print(f"処理時間: {elapsed:.1f}秒")
+            print("=" * 60)
 
-                if i >= 2:
-                    processed_months = i + 1 - self.stats['skipped_months']
-                    if processed_months > 0:
-                        avg_time_per_month = elapsed / processed_months
-                        remaining_months = len(months) - i - 1
-                        remaining_time = avg_time_per_month * remaining_months
-                        print(f"  残り推定: {remaining_time/3600:.1f}時間")
+            return True
 
-                # 月間の間隔
-                time.sleep(2)
-
-            except Exception as e:
-                print(f"エラー: {year}年{month}月 - {e}")
-                continue
-
-        print("\n" + "=" * 60)
-        print("収集完了")
-        print(f"処理月数: {len(months) - self.stats['skipped_months']}")
-        print(f"スキップ月数: {self.stats['skipped_months']}")
-        print(f"総開示件数: {self.stats['total_disclosures']:,}")
-
-        elapsed = time.time() - self.stats['start_time']
-        print(f"総実行時間: {elapsed/3600:.1f}時間")
-        print("=" * 60)
-
-        return True
+        except Exception as e:
+            print(f"エラー: {e}")
+            return False
 
 def main():
     """メイン実行関数"""
-    # 環境変数または直接設定
-    os.environ['AWS_ACCESS_KEY_ID'] = os.getenv('AWS_ACCESS_KEY_ID')
-    os.environ['AWS_SECRET_ACCESS_KEY'] = os.getenv('AWS_SECRET_ACCESS_KEY')
-
-    collector = KabutanMonthlyCollector()
-    collector.run_five_year_monthly_collection()
-
-    print("月ごとデータ収集が完了しました")
+    collector = KabutanDailyCollector()
+    collector.run_daily_collection()
+    print("日次データ収集が完了しました")
 
 if __name__ == "__main__":
     main()
