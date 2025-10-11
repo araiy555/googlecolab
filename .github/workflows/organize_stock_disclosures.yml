@@ -1,0 +1,38 @@
+name: Organize Stock Disclosures
+
+on:
+  schedule:
+    - cron: '0 12 2 * *'  # 毎月2日 UTC 12時（日本時間21時）
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  organize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240  # 4時間まで
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install boto3
+      
+      - name: Run Stock Disclosure Organization
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: python organize_stock_disclosures.py
+      
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: organization-results
+          path: logs/
+          retention-days: 7
