@@ -612,44 +612,4 @@ def install_required_libraries():
 # ===== メイン実行 =====
 
 if __name__ == "__main__":
-    print("""
-JPX株価データ収集システム - 配当日・動的時価総額対応版
-
-最新機能:
-✓ 出来高データ
-✓ 動的時価総額計算（株価 × 発行済株式数）
-✓ 配当日・配当金額
-✓ レート制限対策
-✓ リアルタイムS3保存
-
-CSV列構成:
-始値, 高値, 安値, 終値, 出来高, VWAP, 時価総額, 配当金額, 配当日
-
-実行方法:
-1. test_one_stock()        # 1銘柄テスト
-2. quick_sample(100)       # 100銘柄サンプル
-3. run_safe_collection()   # 全銘柄実行（安全版）
-4. install_required_libraries()  # ライブラリインストール
-""")
-
-    # 自動テスト
-    print("システムテスト中...")
-
-    try:
-        collector = JPXStockCollector()
-        symbols = collector.get_jpx_symbols()
-
-        if symbols:
-            print(f"銘柄取得成功: {len(symbols)} 件")
-            print(f"例: {symbols[:5]}")
-
-            print("\n準備完了！")
-            print("test_one_stock() でテストするか")
-            print("run_safe_collection() で全銘柄実行してください")
-        else:
-            print("銘柄取得失敗")
-            print("install_required_libraries() を実行してください")
-
-    except Exception as e:
-        print(f"システムテストエラー: {e}")
-        print("install_required_libraries() を実行してください")
+　　run_safe_collection()
