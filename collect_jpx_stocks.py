@@ -10,7 +10,10 @@ import os
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from tqdm.notebook import tqdm
+
+# 修正: notebook 用 tqdm ではなく通常の tqdm に変更
+from tqdm import tqdm  
+
 from datetime import datetime, timedelta
 import warnings
 import logging
