@@ -2,43 +2,25 @@ name: JPX Stock Data Collection
 
 on:
   schedule:
-    - cron: '0 16 * * *'  # 毎日UTC 16時（日本時間翌日1時）
-  workflow_dispatch:  # 手動実行も可能
+    - cron: '0 16 * * 1-5'
+  workflow_dispatch:
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6時間まで
+    timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
       
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
+      - run: |
           pip install yfinance pandas numpy requests tqdm xlrd python-calamine openpyxl boto3
       
-      - name: Run JPX Stock Collection
+      - name: Run Collection
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          python - <<'EOF'
-          from collect_jpx_stocks import run_safe_collection
-
-          # GitHub Actions用に自動で実行
-          run_safe_collection()
-          EOF
-      
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: collection-results
-          path: jpx_stock_data/
-          retention-days: 7
+        run: python collect_jpx_stocks_initial.py
