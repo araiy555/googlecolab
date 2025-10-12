@@ -612,4 +612,4 @@ def install_required_libraries():
 # ===== メイン実行 =====
 
 if __name__ == "__main__":
-　　run_safe_collection()
+    run_safe_collection()
