@@ -32,7 +32,7 @@ jobs:
           from collect_jpx_stocks import run_safe_collection
 
           # GitHub Actions用に自動で実行
-          run_safe_collection(auto_confirm=True)
+          run_safe_collection()
           EOF
       
       - name: Upload results
