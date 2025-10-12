@@ -44,7 +44,7 @@ class JPXStockCollector:
         self.config = {
             "max_workers": 3,        # 3並列に制限
             "request_delay": 2.0,    # 2秒待機
-            "chunk_size": 50,        # 50銘柄ずつ
+            "chunk_size": 300,        # 300銘柄ずつ
             "chunk_delay": 120       # チャンク間2分休憩
         }
 
