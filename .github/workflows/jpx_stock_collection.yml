@@ -27,7 +27,13 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: python collect_jpx_stocks.py
+        run: |
+          python - <<'EOF'
+          from collect_jpx_stocks import run_safe_collection
+
+          # GitHub Actions用に自動で実行
+          run_safe_collection(auto_confirm=True)
+          EOF
       
       - name: Upload results
         if: always()
