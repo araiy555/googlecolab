@@ -488,10 +488,10 @@ def run_safe_collection():
     print(f"  S3保存: チャンクごとリアルタイム")
     print(f"  レート制限対策: 有効")
 
-    confirm = input("\n実行しますか？ (y/N): ").strip().lower()
-    if confirm != 'y':
-        print("実行中止")
-        return None
+    # confirm = input("\n実行しますか？ (y/N): ").strip().lower()
+    # if confirm != 'y':
+    #    print("実行中止")
+    #    return None
 
     # Step 4: データ収集実行
     start_time = time.time()
