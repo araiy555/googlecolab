@@ -614,5 +614,27 @@ def install_required_libraries():
 
 # ===== メイン実行 =====
 
-if __name__ == "__main__":
-    run_safe_collection()
+if __name__ == "__main__":]
+   try:
+        run_safe_collection()
+        status = "✅ 成功"
+        color = "good"
+    except Exception as e:
+        status = f"❌ 失敗: {str(e)}"
+        color = "danger"
+    
+    # 環境変数からWebhook URLを取得
+    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    
+    if slack_webhook_url:
+        message = {
+            "attachments": [{
+                "color": color,
+                "title": "データ収集完了",
+                "text": status,
+                "footer": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }]
+        }
+        requests.post(slack_webhook_url, json=message)
+    else:
+        print("警告: SLACK_WEBHOOK_URLが設定されていません")
