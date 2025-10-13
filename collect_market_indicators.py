@@ -10,6 +10,7 @@ import json
 import os
 from datetime import datetime, timedelta
 import yfinance as yf
+import requests
 
 class MarketIndicatorsCollector:
     def __init__(self):
