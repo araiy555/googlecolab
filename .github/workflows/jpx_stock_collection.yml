@@ -2,7 +2,7 @@ name: JPX Stock Data Collection
 
 on:
   schedule:
-    - cron: '0 16 * * 1-5'
+    - cron: '0 16 * * *'
   workflow_dispatch:
 
 jobs:
