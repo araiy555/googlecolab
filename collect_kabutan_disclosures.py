@@ -414,11 +414,43 @@ class KabutanDailyCollector:
             print(f"エラー: {e}")
             return False
 
+
+def notify_slack(status, message):
+    """Slackに通知を送る"""
+    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    
+    if not slack_webhook_url:
+        print("警告: SLACK_WEBHOOK_URLが設定されていません")
+        return
+    
+    color = "good" if status == "success" else "danger"
+    emoji = "✅" if status == "success" else "❌"
+    
+    payload = {
+        "attachments": [{
+            "color": color,
+            "title": f"{emoji} 日次データ収集",
+            "text": message,
+            "footer": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }]
+    }
+    
+    try:
+        requests.post(slack_webhook_url, json=payload)
+    except Exception as e:
+        print(f"Slack通知エラー: {e}")
+
+
 def main():
     """メイン実行関数"""
-    collector = KabutanDailyCollector()
-    collector.run_daily_collection()
-    print("日次データ収集が完了しました")
+    try:
+        collector = KabutanDailyCollector()
+        collector.run_daily_collection()
+        print("日次データ収集が完了しました")
+        notify_slack("success", "日次データ収集が正常に完了しました")
+    except Exception as e:
+        print(f"エラーが発生しました: {e}")
+        notify_slack("failure", f"エラーが発生しました: {str(e)}")
 
 if __name__ == "__main__":
     main()
