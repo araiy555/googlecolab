@@ -613,9 +613,8 @@ def install_required_libraries():
             print(f"✗ {lib}: {e}")
 
 # ===== メイン実行 =====
-
 if __name__ == "__main__":
-   try:
+    try:
         run_safe_collection()
         status = "✅ 成功"
         color = "good"
