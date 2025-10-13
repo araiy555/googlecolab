@@ -241,7 +241,7 @@ class MarketIndicatorsCollector:
 def notify_slack(status, message):
     """Slackに通知を送る"""
     slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
-    
+    print(f"Webhook URL: {slack_webhook_url}")  # デバッグ用
     if not slack_webhook_url:
         print("警告: SLACK_WEBHOOK_URLが設定されていません")
         return
