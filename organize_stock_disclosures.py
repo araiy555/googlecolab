@@ -13,6 +13,7 @@ import logging
 import re
 from typing import Dict, List, Any, Optional
 import time
+import requests
 
 class StockBasedDataOrganizer:
     def __init__(self):
@@ -532,19 +533,47 @@ class StockBasedDataOrganizer:
             self.logger.error(f"実行エラー: {e}")
             return False
 
+def notify_slack(status, message):
+    """Slackに通知を送る"""
+    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    
+    if not slack_webhook_url:
+        print("警告: SLACK_WEBHOOK_URLが設定されていません")
+        return
+    
+    color = "good" if status == "success" else "danger"
+    emoji = "✅" if status == "success" else "❌"
+    
+    payload = {
+        "attachments": [{
+            "color": color,
+            "title": f"{emoji} 銘柄別データ整理",
+            "text": message,
+            "footer": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }]
+    }
+    
+    try:
+        requests.post(slack_webhook_url, json=payload)
+    except Exception as e:
+        print(f"Slack通知エラー: {e}")
+
+
 def main():
     """メイン実行関数"""
     try:
         organizer = StockBasedDataOrganizer()
         success = organizer.run_stock_based_organization()
-
+        
         if success:
             print("銘柄別データ整理が正常に完了しました")
+            notify_slack("success", "銘柄別データ整理が正常に完了しました")
         else:
             print("処理中にエラーが発生しました")
-
+            notify_slack("failure", "処理中にエラーが発生しました")
     except Exception as e:
         print(f"実行エラー: {e}")
+        notify_slack("failure", f"実行エラー: {str(e)}")
 
 if __name__ == "__main__":
     main()
