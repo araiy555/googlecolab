@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install yfinance boto3
+          pip install yfinance boto3 requests
       
       - name: Run Market Indicators Collection
         env:
