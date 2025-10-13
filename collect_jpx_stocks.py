@@ -614,7 +614,7 @@ def install_required_libraries():
 
 # ===== メイン実行 =====
 
-if __name__ == "__main__":]
+if __name__ == "__main__":
    try:
         run_safe_collection()
         status = "✅ 成功"
