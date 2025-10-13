@@ -238,12 +238,46 @@ class MarketIndicatorsCollector:
         print("="*60)
         return complete_data
 
+def notify_slack(status, message):
+    """Slackに通知を送る"""
+    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    
+    if not slack_webhook_url:
+        print("警告: SLACK_WEBHOOK_URLが設定されていません")
+        return
+    
+    color = "good" if status == "success" else "danger"
+    emoji = "✅" if status == "success" else "❌"
+    
+    payload = {
+        "attachments": [{
+            "color": color,
+            "title": f"{emoji} 市場指標データ収集",
+            "text": message,
+            "footer": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }]
+    }
+    
+    try:
+        requests.post(slack_webhook_url, json=payload)
+    except Exception as e:
+        print(f"Slack通知エラー: {e}")
+
+
 def main():
     """メイン実行"""
-    collector = MarketIndicatorsCollector()
-    result = collector.run_collection(years=5)
-    print("\n処理完了")
-    print(f"データ保存先: s3://{collector.bucket_name}/{collector.s3_prefix}")
+    try:
+        collector = MarketIndicatorsCollector()
+        result = collector.run_collection(years=5)
+        
+        s3_path = f"s3://{collector.bucket_name}/{collector.s3_prefix}"
+        print("\n処理完了")
+        print(f"データ保存先: {s3_path}")
+        
+        notify_slack("success", f"市場指標データ収集が完了しました\nデータ保存先: {s3_path}")
+    except Exception as e:
+        print(f"エラーが発生しました: {e}")
+        notify_slack("failure", f"エラーが発生しました: {str(e)}")
 
 if __name__ == "__main__":
     main()
