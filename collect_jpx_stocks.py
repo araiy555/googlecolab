@@ -10,10 +10,7 @@ import os
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-
-# 修正: notebook 用 tqdm ではなく通常の tqdm に変更
-from tqdm import tqdm  
-
+from tqdm import tqdm
 from datetime import datetime, timedelta
 import warnings
 import logging
@@ -21,8 +18,6 @@ from pathlib import Path
 import boto3
 
 warnings.filterwarnings('ignore')
-
-# ログ設定（エラーメッセージ抑制）
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
@@ -36,16 +31,14 @@ class JPXStockCollector:
         self.lock = threading.Lock()
         self.s3_client = None
 
-        # 保存ディレクトリ
         self.data_dir = Path("jpx_stock_data")
         self.data_dir.mkdir(exist_ok=True)
 
-        # レート制限対策設定
         self.config = {
-            "max_workers": 3,        # 3並列に制限
-            "request_delay": 2.0,    # 2秒待機
-            "chunk_size": 300,        # 300銘柄ずつ
-            "chunk_delay": 120       # チャンク間2分休憩
+            "max_workers": 3,
+            "request_delay": 2.0,
+            "chunk_size": 300,
+            "chunk_delay": 120
         }
 
         print("JPX株価収集システム - 配当日・動的時価総額対応版")
@@ -60,12 +53,9 @@ class JPXStockCollector:
                 aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
                 region_name="ap-northeast-1"
             )
-
-            # 接続テスト
             self.s3_client.head_bucket(Bucket="m-s3storage")
             print("S3接続成功: s3://m-s3storage/japan-stocks-5years-chart/")
             return True
-
         except Exception as e:
             print(f"S3接続失敗: {e}")
             return False
@@ -74,14 +64,12 @@ class JPXStockCollector:
         """JPX銘柄取得 - Excelデータのみ使用"""
         print("JPX銘柄リスト取得中...")
 
-        # JPX公式データ取得
         jpx_data = self._download_jpx_data()
         if jpx_data is None:
             raise Exception("JPX Excelファイル取得失敗")
 
         print(f"Excel取得成功: {len(jpx_data)} 行")
 
-        # 銘柄抽出
         symbols = self._extract_symbols(jpx_data)
         if not symbols or len(symbols) < 100:
             raise Exception(f"銘柄抽出失敗: {len(symbols) if symbols else 0} 銘柄のみ抽出")
@@ -104,17 +92,14 @@ class JPXStockCollector:
             if response.status_code == 200 and len(response.content) > 100000:
                 content = response.content
 
-                # HTMLでないことを確認
                 if b'<html' not in content[:500].lower():
                     try:
-                        # xlrd使用
                         df = pd.read_excel(io.BytesIO(content), engine='xlrd', dtype=str)
                         if len(df) > 1000:
                             print(f"JPX Excel解析成功: {len(df)} 行")
                             return df
                     except:
                         try:
-                            # calamine使用
                             df = pd.read_excel(io.BytesIO(content), engine='calamine', dtype=str)
                             if len(df) > 1000:
                                 print(f"JPX Excel解析成功: {len(df)} 行")
@@ -128,7 +113,7 @@ class JPXStockCollector:
             return None
 
     def _extract_symbols(self, df):
-        """銘柄コード抽出 - デバッグ強化"""
+        """銘柄コード抽出 - 英字銘柄対応"""
         print(f"銘柄コード抽出開始: {df.shape}")
         print(f"列名: {list(df.columns)}")
         print("データサンプル:")
@@ -137,30 +122,43 @@ class JPXStockCollector:
         symbols = set()
         import re
 
-        # 全ての列をチェック
         for col_idx, col in enumerate(df.columns):
             col_symbols = []
 
             for value in df[col].dropna():
                 value_str = str(value).strip()
 
-                # パターン1: 4桁数値
+                # パターン1: 4桁数値のみ
                 if value_str.isdigit() and len(value_str) == 4:
                     code = int(value_str)
                     if 1000 <= code <= 9999:
                         col_symbols.append(f"{value_str}.T")
                         symbols.add(f"{value_str}.T")
 
-                # パターン2: 小数点付き
+                # パターン2: 数字+英字（130A, 1475BXなど）
+                elif re.match(r'^\d{3,4}[A-Z]{1,2}$', value_str):
+                    col_symbols.append(f"{value_str}.T")
+                    symbols.add(f"{value_str}.T")
+
+                # パターン3: 小数点付き
                 elif '.' in value_str:
                     parts = value_str.split('.')
-                    if len(parts) >= 2 and parts[0].isdigit() and len(parts[0]) == 4:
-                        code = int(parts[0])
-                        if 1000 <= code <= 9999:
-                            col_symbols.append(f"{parts[0]}.T")
-                            symbols.add(f"{parts[0]}.T")
+                    if len(parts) >= 2:
+                        code_part = parts[0]
+                        
+                        # 数値のみ
+                        if code_part.isdigit() and len(code_part) == 4:
+                            code = int(code_part)
+                            if 1000 <= code <= 9999:
+                                col_symbols.append(f"{code_part}.T")
+                                symbols.add(f"{code_part}.T")
+                        
+                        # 数字+英字
+                        elif re.match(r'^\d{3,4}[A-Z]{1,2}$', code_part):
+                            col_symbols.append(f"{code_part}.T")
+                            symbols.add(f"{code_part}.T")
 
-                # パターン3: 正規表現
+                # パターン4: 正規表現で4桁数値抽出
                 matches = re.findall(r'\b(\d{4})\b', value_str)
                 for match in matches:
                     code = int(match)
@@ -174,7 +172,16 @@ class JPXStockCollector:
                     print(f"  例: {col_symbols[:5]}")
 
         result = sorted(list(symbols))
-        print(f"最終抽出結果: {len(result)} 銘柄")
+        
+        # 英字銘柄の集計表示
+        alphabetic = [s for s in result if re.search(r'[A-Z]', s.replace('.T', ''))]
+        numeric_only = [s for s in result if not re.search(r'[A-Z]', s.replace('.T', ''))]
+        
+        print(f"\n最終抽出結果: 合計 {len(result)} 銘柄")
+        print(f"  数値のみ: {len(numeric_only)} 銘柄")
+        if alphabetic:
+            print(f"  英字付き: {len(alphabetic)} 銘柄")
+            print(f"  英字例: {alphabetic[:10]}")
 
         if result:
             print(f"抽出例: {result[:10]}")
@@ -184,7 +191,6 @@ class JPXStockCollector:
     def get_stock_data_safe(self, symbol):
         """安全な株価データ取得（配当日・動的時価総額対応）"""
         try:
-            # 長い待機でレート制限回避
             time.sleep(self.config["request_delay"])
 
             ticker = yf.Ticker(symbol)
@@ -202,12 +208,9 @@ class JPXStockCollector:
                 info = ticker.info
                 shares_outstanding = info.get('sharesOutstanding', None)
 
-                # 時価総額計算（株価 × 発行済株式数）
                 if shares_outstanding:
-                    # 正確な時価総額計算
                     data['時価総額'] = data['Close'] * shares_outstanding
                 else:
-                    # フォールバック: 現在時価総額から逆算
                     current_market_cap = info.get('marketCap', None)
                     if current_market_cap:
                         current_price = data['Close'].iloc[-1]
@@ -234,23 +237,18 @@ class JPXStockCollector:
             # 配当データ取得
             try:
                 dividends = ticker.dividends
-                # 5年分に絞る
                 five_years_ago = data.index[0]
                 recent_dividends = dividends[dividends.index >= five_years_ago]
 
-                # 配当関連列を初期化
                 data['配当金額'] = 0.0
-                data['配当日'] = ''  # 配当日の文字列
+                data['配当日'] = ''
 
                 for div_date, div_amount in recent_dividends.items():
-                    # 配当日に最も近い取引日を見つける
                     closest_date = data.index[data.index.get_indexer([div_date], method='nearest')[0]]
                     data.loc[closest_date, '配当金額'] = div_amount
-                    # 実際の配当日を記録
                     data.loc[closest_date, '配当日'] = div_date.strftime('%Y-%m-%d')
 
             except Exception as div_error:
-                # 配当データ取得失敗時は空で埋める
                 data['配当金額'] = 0.0
                 data['配当日'] = ''
 
@@ -260,13 +258,12 @@ class JPXStockCollector:
             }
 
         except Exception as e:
-            # レート制限エラーは表示しない
             if "Too Many Requests" not in str(e) and "Rate limited" not in str(e):
                 print(f"{symbol} エラー: {e}")
             return None
 
     def upload_chunk_to_s3(self, chunk_symbols):
-        """チャンクをS3アップロード - 配当日・時価総額対応"""
+        """チャンクをS3アップロード"""
         if not self.s3_client:
             return 0
 
@@ -278,7 +275,6 @@ class JPXStockCollector:
                     clean_symbol = symbol.replace('.T', '')
                     price_data = self.stock_data[symbol]['price_data']
 
-                    # 日本語列名でリネーム
                     jp_data = price_data.rename(columns={
                         'Open': '始値',
                         'High': '高値',
@@ -286,14 +282,11 @@ class JPXStockCollector:
                         'Close': '終値',
                         'Volume': '出来高',
                         'VWAP': 'VWAP'
-                        # '時価総額', '配当金額', '配当日' はそのまま
                     })
 
-                    # CSV作成
                     csv_buffer = io.StringIO()
                     jp_data.to_csv(csv_buffer, encoding='utf-8-sig')
 
-                    # S3アップロード - シンプル名
                     s3_key = f"japan-stocks-5years-chart/stocks/{clean_symbol}.csv"
 
                     self.s3_client.put_object(
@@ -306,13 +299,12 @@ class JPXStockCollector:
                     uploaded += 1
 
                 except Exception as e:
-                    # S3エラーも抑制
                     pass
 
         return uploaded
 
     def collect_all_stocks(self):
-        """全銘柄収集 - レート制限対策"""
+        """全銘柄収集"""
         if not self.jpx_symbols:
             print("銘柄リストなし")
             return False
@@ -321,7 +313,6 @@ class JPXStockCollector:
         print(f"データ収集開始: {total} 銘柄")
         print(f"レート制限対策: {self.config['request_delay']}秒間隔, {self.config['max_workers']}並列")
 
-        # チャンク分割
         chunk_size = self.config["chunk_size"]
         chunks = [self.jpx_symbols[i:i+chunk_size] for i in range(0, len(self.jpx_symbols), chunk_size)]
 
@@ -358,34 +349,28 @@ class JPXStockCollector:
                             '成功率': f"{success_count/(success_count + len(self.failed_symbols))*100:.1f}%"
                         })
 
-            # チャンク完了後の処理
             chunk_time = time.time() - chunk_start_time
 
-            # S3アップロード
             if self.s3_client and chunk_success > 0:
                 uploaded = self.upload_chunk_to_s3(chunk)
                 total_uploaded += uploaded
                 print(f"S3アップロード完了: {uploaded} ファイル (累計: {total_uploaded})")
 
-            # 進捗表示
             remaining_chunks = len(chunks) - chunk_idx - 1
             estimated_remaining = remaining_chunks * (chunk_time + self.config["chunk_delay"]) / 60
             print(f"チャンク{chunk_idx + 1}完了: {chunk_success}/{len(chunk)} 成功")
             print(f"残り推定時間: {estimated_remaining:.1f} 分")
 
-            # チャンク間休憩（レート制限回避）
             if chunk_idx < len(chunks) - 1:
                 print(f"休憩中... {self.config['chunk_delay']} 秒")
                 time.sleep(self.config["chunk_delay"])
 
-        # 最終結果
         print(f"\n収集完了:")
         print(f"  成功: {success_count} 銘柄")
         print(f"  失敗: {len(self.failed_symbols)} 銘柄")
         print(f"  成功率: {success_count/(success_count + len(self.failed_symbols))*100:.1f}%")
         print(f"  S3アップロード: {total_uploaded} ファイル")
 
-        # 最終サマリー保存
         if self.s3_client and self.stock_data:
             self._save_summary_to_s3()
 
@@ -404,7 +389,6 @@ class JPXStockCollector:
                 latest_price = price_data['Close'].iloc[-1]
                 total_return = (latest_price / first_price - 1) * 100
 
-                # 配当統計
                 dividend_count = len(price_data[price_data['配当金額'] > 0])
                 total_dividends = price_data['配当金額'].sum()
 
@@ -427,7 +411,6 @@ class JPXStockCollector:
             summary_df = pd.DataFrame(summary_data)
             summary_csv = summary_df.to_csv(index=False, encoding='utf-8-sig')
 
-            # S3保存 - 固定名
             self.s3_client.put_object(
                 Bucket="m-s3storage",
                 Key="japan-stocks-5years-chart/summary.csv",
@@ -437,7 +420,6 @@ class JPXStockCollector:
 
             print("サマリー保存完了: summary.csv")
 
-            # 基本統計表示
             total_stocks = len(summary_df)
             positive_returns = len(summary_df[summary_df['5年変化率(%)'] > 0])
             dividend_stocks = len(summary_df[summary_df['配当回数'] > 0])
@@ -453,7 +435,6 @@ class JPXStockCollector:
         except Exception as e:
             print(f"サマリー保存エラー: {e}")
 
-# ===== 実行関数 =====
 
 def run_safe_collection():
     """レート制限対策版実行"""
@@ -462,7 +443,6 @@ def run_safe_collection():
 
     collector = JPXStockCollector()
 
-    # Step 1: 銘柄取得
     symbols = collector.get_jpx_symbols()
     if not symbols:
         print("銘柄取得失敗")
@@ -471,13 +451,11 @@ def run_safe_collection():
     collector.jpx_symbols = symbols
     print(f"対象銘柄: {len(symbols)} 件")
 
-    # Step 2: S3接続
     s3_ok = collector.setup_s3()
     if not s3_ok:
         print("S3接続失敗")
         return None
 
-    # Step 3: 実行確認
     estimated_time = (len(symbols) / collector.config["chunk_size"]) * (
         collector.config["chunk_size"] * collector.config["request_delay"] / collector.config["max_workers"] +
         collector.config["chunk_delay"]
@@ -486,133 +464,17 @@ def run_safe_collection():
     print(f"\n実行確認:")
     print(f"  対象銘柄数: {len(symbols):,}")
     print(f"  推定処理時間: {estimated_time:.1f} 分")
-    print(f"  CSV列構成: 始値,高値,安値,終値,出来高,VWAP,時価総額,配当金額,配当日")
-    print(f"  ファイル名形式: 1332.csv (シンプル・上書き)")
-    print(f"  S3保存: チャンクごとリアルタイム")
-    print(f"  レート制限対策: 有効")
 
-    # confirm = input("\n実行しますか？ (y/N): ").strip().lower()
-    # if confirm != 'y':
-    #    print("実行中止")
-    #    return None
-
-    # Step 4: データ収集実行
     start_time = time.time()
     success = collector.collect_all_stocks()
     elapsed = time.time() - start_time
 
     print(f"\n処理完了: {elapsed/60:.1f} 分")
     print(f"S3保存先: s3://m-s3storage/japan-stocks-5years-chart/stocks/")
-    print(f"ファイル名例: 1332.csv, 7203.csv, summary.csv")
 
     return collector
 
-def test_one_stock():
-    """1銘柄テスト（配当日・時価総額確認）"""
-    print("1銘柄テスト実行")
 
-    collector = JPXStockCollector()
-
-    # S3接続
-    if not collector.setup_s3():
-        return False
-
-    # テスト銘柄
-    test_symbol = "7203.T"  # トヨタ
-    print(f"テスト対象: {test_symbol}")
-
-    result = collector.get_stock_data_safe(test_symbol)
-
-    if result:
-        collector.stock_data[test_symbol] = result
-
-        # S3アップロード
-        uploaded = collector.upload_chunk_to_s3([test_symbol])
-
-        price_data = result['price_data']
-        company_info = result['company_info']
-
-        # 配当日確認
-        dividend_days = price_data[price_data['配当金額'] > 0]
-        total_dividends = price_data['配当金額'].sum()
-
-        print(f"成功: {company_info['name']}")
-        print(f"期間: {price_data.index[0].date()} - {price_data.index[-1].date()}")
-        print(f"最新価格: ¥{price_data['Close'].iloc[-1]:,.0f}")
-
-        # 時価総額表示
-        if price_data['時価総額'].iloc[-1]:
-            market_cap_billion = price_data['時価総額'].iloc[-1] / 1000000000000
-            print(f"最新時価総額: ¥{market_cap_billion:.2f}兆円")
-        else:
-            print("時価総額: N/A")
-
-        # 配当情報表示
-        print(f"配当回数: {len(dividend_days)} 回")
-        print(f"総配当額: ¥{total_dividends:.2f}")
-        if len(dividend_days) > 0:
-            print(f"配当履歴:")
-            for idx, row in dividend_days.iterrows():
-                trading_date = idx.strftime('%Y-%m-%d')
-                dividend_date = row['配当日']
-                print(f"  取引日:{trading_date} → 配当日:{dividend_date} → ¥{row['配当金額']:.2f}")
-
-        print(f"S3保存: {'成功' if uploaded > 0 else '失敗'}")
-        print(f"ファイル名: 7203.csv")
-
-        return True
-    else:
-        print("テスト失敗")
-        return False
-
-def quick_sample(sample_size=100):
-    """クイックサンプル実行"""
-    print(f"クイックサンプル実行: {sample_size} 銘柄")
-
-    collector = JPXStockCollector()
-
-    symbols = collector.get_jpx_symbols()
-    if symbols:
-        # サンプル抽出
-        import random
-        sample_symbols = random.sample(symbols, min(sample_size, len(symbols)))
-        collector.jpx_symbols = sample_symbols
-
-        print(f"サンプル銘柄: {len(sample_symbols)} 件")
-
-        if collector.setup_s3():
-            collector.collect_all_stocks()
-            return collector
-
-    return None
-
-def install_required_libraries():
-    """必要ライブラリインストール"""
-    import subprocess
-    import sys
-
-    libraries = [
-        "yfinance>=0.2.18",
-        "pandas>=1.5.0",
-        "numpy>=1.21.0",
-        "requests>=2.28.0",
-        "tqdm>=4.64.0",
-        "xlrd>=2.0.1",
-        "python-calamine>=0.1.0",
-        "openpyxl>=3.0.0",
-        "boto3>=1.26.0"
-    ]
-
-    print("必要ライブラリインストール中...")
-
-    for lib in libraries:
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", lib])
-            print(f"✓ {lib}")
-        except Exception as e:
-            print(f"✗ {lib}: {e}")
-
-# ===== メイン実行 =====
 if __name__ == "__main__":
     try:
         run_safe_collection()
@@ -622,7 +484,6 @@ if __name__ == "__main__":
         status = f"❌ 失敗: {str(e)}"
         color = "danger"
     
-    # 環境変数からWebhook URLを取得
     slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
     
     if slack_webhook_url:
