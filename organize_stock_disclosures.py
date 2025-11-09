@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-株探データを銘柄別に整理するシステム（日次版）
-毎日当月と前月のデータのみを処理・更新
+株探5年分データを銘柄別に整理するシステム（モード対応版）
+- full mode: 5年分全データを処理
+- incremental mode: 直近2ヶ月のみ処理して既存データに追加
 """
 
 import json
@@ -11,14 +12,21 @@ from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 import logging
 import re
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import time
-import requests
 
 class StockBasedDataOrganizer:
-    def __init__(self):
-        """銘柄別データ整理システム初期化"""
-        # S3設定（環境変数から認証情報を取得）
+    def __init__(self, mode='incremental'):
+        """
+        銘柄別データ整理システム初期化
+        
+        Args:
+            mode: 'full' (5年分全て) または 'incremental' (直近2ヶ月のみ)
+        """
+        self.mode = mode
+        
+        # AWS認証情報を直接設定
+        import os
         aws_access_key = os.getenv('AWS_ACCESS_KEY_ID')
         aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
 
@@ -28,12 +36,13 @@ class StockBasedDataOrganizer:
                 aws_access_key_id=aws_access_key,
                 aws_secret_access_key=aws_secret_key,
                 region_name="ap-northeast-1"
-            )
-        else:
-            self.s3 = boto3.client('s3', region_name="ap-northeast-1")
-
+        )
         self.bucket_name = "m-s3storage"
+
+        # データ取得パス（正確なパス）
         self.source_prefix = "japan-stocks-5years-chart/monthly-disclosures/"
+
+        # 出力パス
         self.output_prefix = "japan-stocks-5years-chart/stock-based-disclosures/"
 
         # ログ設定
@@ -45,16 +54,20 @@ class StockBasedDataOrganizer:
 
         # 統計
         self.stats = {
+            'mode': mode,
             'total_disclosures': 0,
+            'new_disclosures': 0,
+            'duplicate_disclosures': 0,
             'unique_stocks': 0,
             'processed_months': 0,
             'created_files': 0,
+            'updated_files': 0,
             'errors': 0,
             'start_time': None
         }
 
-    def get_target_months(self):
-        """対象月を取得（当月と前月）"""
+    def get_target_months(self) -> List[Tuple[int, int]]:
+        """対象月を取得（incrementalモード用）"""
         today = datetime.now()
         current_year = today.year
         current_month = today.month
@@ -74,18 +87,102 @@ class StockBasedDataOrganizer:
 
         return months
 
-    def load_target_monthly_data(self, target_months) -> Dict[str, List[Dict]]:
-        """対象月のデータのみ読み込み、銘柄別に整理"""
+    def get_monthly_files_list(self) -> List[str]:
+        """S3から月次ファイルリストを取得"""
+        try:
+            paginator = self.s3.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=self.bucket_name, Prefix=self.source_prefix)
+
+            monthly_files = []
+            for page in pages:
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        key = obj['Key']
+                        # 月次ファイルの正確な形式: YYYY-MM.json
+                        if key.endswith('.json') and re.search(r'/\d{4}-\d{2}\.json$', key):
+                            monthly_files.append(key)
+
+            monthly_files.sort()
+            return monthly_files
+            
+        except Exception as e:
+            self.logger.error(f"S3ファイル一覧取得エラー: {e}")
+            return []
+
+    def load_existing_stock_data(self, stock_code: str) -> Optional[Dict]:
+        """既存の銘柄データをS3から読み込み（incrementalモード用）"""
+        try:
+            key = f"{self.output_prefix}{stock_code}.json"
+            response = self.s3.get_object(Bucket=self.bucket_name, Key=key)
+            data = json.loads(response['Body'].read().decode('utf-8'))
+            return data
+        except self.s3.exceptions.NoSuchKey:
+            return None
+        except Exception as e:
+            self.logger.warning(f"既存データ読み込みエラー ({stock_code}): {e}")
+            return None
+
+    def create_disclosure_key(self, disclosure: Dict) -> str:
+        """開示データのユニークキーを生成（重複判定用）"""
+        stock_code = disclosure.get('stock_code', '')
+        date = disclosure.get('date_normalized') or disclosure.get('date', '')
+        title = disclosure.get('title', '')
+        return f"{stock_code}_{date}_{title}"
+
+    def merge_disclosures(self, existing: List[Dict], new: List[Dict]) -> List[Dict]:
+        """既存データと新規データをマージ（重複排除）"""
+        # 既存データのキーセット作成
+        existing_keys = {self.create_disclosure_key(d) for d in existing}
+        
+        merged = existing.copy()
+        new_count = 0
+        duplicate_count = 0
+        
+        for disclosure in new:
+            key = self.create_disclosure_key(disclosure)
+            if key not in existing_keys:
+                merged.append(disclosure)
+                existing_keys.add(key)
+                new_count += 1
+            else:
+                duplicate_count += 1
+        
+        self.stats['new_disclosures'] += new_count
+        self.stats['duplicate_disclosures'] += duplicate_count
+        
+        return merged
+
+    def load_all_monthly_data(self) -> Dict[str, List[Dict]]:
+        """全月次データを読み込み、銘柄別に整理"""
         stock_data = defaultdict(list)
 
         try:
-            self.logger.info(f"対象月: {target_months}")
+            self.logger.info(f"📦 {self.mode.upper()} MODE: データ読み込み開始")
+            
+            # モードに応じてファイルリストを決定
+            if self.mode == 'full':
+                # 全ファイル取得
+                monthly_files = self.get_monthly_files_list()
+                self.logger.info(f"5年分全データを処理: {len(monthly_files)}ファイル")
+            else:
+                # 直近2ヶ月のみ
+                target_months = self.get_target_months()
+                monthly_files = []
+                for year, month in target_months:
+                    file_key = f"{self.source_prefix}{year}-{month:02d}.json"
+                    monthly_files.append(file_key)
+                self.logger.info(f"直近2ヶ月のみ処理: {target_months[0][0]}年{target_months[0][1]}月 と {target_months[1][0]}年{target_months[1][1]}月")
 
-            for year, month in target_months:
-                file_key = f"{self.source_prefix}{year}-{month:02d}.json"
-                self.logger.info(f"読み込み: {file_key}")
+            if not monthly_files:
+                self.logger.error(f"月次ファイルが見つかりません")
+                return {}
 
+            # 各月次ファイルを処理
+            for i, file_key in enumerate(monthly_files, 1):
                 try:
+                    self.logger.info(f"[{i}/{len(monthly_files)}] 処理中: {os.path.basename(file_key)}")
+
+                    # S3からファイル取得
                     response = self.s3.get_object(Bucket=self.bucket_name, Key=file_key)
                     file_content = response['Body'].read().decode('utf-8')
                     data = json.loads(file_content)
@@ -114,36 +211,42 @@ class StockBasedDataOrganizer:
                             processed_count += 1
                             self.stats['total_disclosures'] += 1
 
-                    self.logger.info(f"  処理完了: {processed_count}件")
+                    self.logger.info(f"  ✓ 処理完了: {processed_count:,}件")
                     self.stats['processed_months'] += 1
 
                 except Exception as e:
-                    self.logger.error(f"ファイル処理エラー: {file_key} - {e}")
+                    self.logger.error(f"ファイル処理エラー: {os.path.basename(file_key)} - {e}")
                     self.stats['errors'] += 1
                     continue
 
             self.stats['unique_stocks'] = len(stock_data)
-            self.logger.info(f"対象月データ読み込み完了: {len(stock_data)}銘柄")
+            self.logger.info(f"\nデータ読み込み完了:")
+            self.logger.info(f"  - 処理ファイル数: {self.stats['processed_months']}")
+            self.logger.info(f"  - 読込開示件数: {self.stats['total_disclosures']:,}件")
+            self.logger.info(f"  - ユニーク銘柄数: {self.stats['unique_stocks']:,}銘柄")
 
             return dict(stock_data)
 
         except Exception as e:
-            self.logger.error(f"データ読み込みエラー: {e}")
+            self.logger.error(f"データ読み込み全体エラー: {e}")
             return {}
 
     def enhance_disclosure_data(self, disclosure: Dict) -> Dict:
-        """開示データの拡張・強化"""
+        """開示データの拡張・強化 - 既存データのみ使用"""
         enhanced = disclosure.copy()
 
+        # 基本情報の正規化
         stock_code = enhanced.get('stock_code', '').strip()
         enhanced['stock_code'] = stock_code
 
+        # 既存の会社名をそのまま使用
         company_name = enhanced.get('company_name', '').strip()
         if company_name and company_name not in ['抽出中', '不明', '']:
             enhanced['company_name_cleaned'] = self.normalize_company_name(company_name)
         else:
             enhanced['company_name_cleaned'] = f"銘柄{stock_code}"
 
+        # 日付の正規化
         date_str = enhanced.get('date', '')
         if date_str:
             enhanced['date_normalized'] = self.normalize_date(date_str)
@@ -151,13 +254,19 @@ class StockBasedDataOrganizer:
             enhanced['month'] = int(enhanced['date_normalized'][5:7]) if enhanced['date_normalized'] else None
             enhanced['quarter'] = self.get_quarter(enhanced['month']) if enhanced['month'] else None
 
+        # カテゴリの詳細分類
         enhanced['category_detailed'] = self.detailed_categorization(
             enhanced.get('title', ''),
             enhanced.get('company_name', '')
         )
 
+        # 重要度スコアの計算
         enhanced['importance_score'] = self.calculate_importance_score(enhanced)
+
+        # 開示タイプの分類
         enhanced['disclosure_type'] = self.classify_disclosure_type(enhanced)
+
+        # タイムスタンプ追加
         enhanced['processed_at'] = datetime.now().isoformat()
 
         return enhanced
@@ -176,7 +285,6 @@ class StockBasedDataOrganizer:
             normalized = re.sub(pattern, '', normalized)
 
         normalized = normalized.replace('(株)', '').replace('㈱', '')
-
         return normalized.strip()
 
     def normalize_date(self, date_str: str) -> str:
@@ -248,17 +356,19 @@ class StockBasedDataOrganizer:
         return 'その他'
 
     def calculate_importance_score(self, disclosure: Dict) -> float:
-        """重要度スコアの計算"""
+        """重要度スコアの計算（0.0-1.0）"""
         score = 0.0
         title = disclosure.get('title', '').lower()
         category = disclosure.get('category_detailed', '')
 
         high_importance_categories = [
-            '決算短信', '業績予想修正', '代表取締役', 'M&A買収', '第三者割当増資'
+            '決算短信', '業績予想修正', '代表取締役', 'M&A買収',
+            '第三者割当増資'
         ]
 
         medium_importance_categories = [
-            '決算説明会', '配当金', '株式分割', '自己株式取得', '新規事業', '業務提携', '設備投資'
+            '決算説明会', '配当金', '株式分割', '自己株式取得', '新規事業',
+            '業務提携', '設備投資'
         ]
 
         if category in high_importance_categories:
@@ -269,7 +379,8 @@ class StockBasedDataOrganizer:
             score += 0.1
 
         high_impact_keywords = [
-            '業績予想修正', '赤字', '黒字転換', '増配', '減配', '無配', '買収', '合併'
+            '業績予想修正', '赤字', '黒字転換', '増配', '減配', '無配',
+            '買収', '合併'
         ]
 
         for keyword in high_impact_keywords:
@@ -300,7 +411,7 @@ class StockBasedDataOrganizer:
             return 'その他'
 
     def create_stock_summary(self, stock_code: str, disclosures: List[Dict]) -> Dict:
-        """銘柄サマリーの作成"""
+        """銘柄サマリーの作成 - 開示データから情報を抽出"""
         if not disclosures:
             return {}
 
@@ -347,13 +458,24 @@ class StockBasedDataOrganizer:
             reverse=True
         )[:20]
 
+        # 期間を計算
+        if date_range.get('start_date') and date_range.get('end_date'):
+            try:
+                start = datetime.strptime(date_range['start_date'], '%Y-%m-%d')
+                end = datetime.strptime(date_range['end_date'], '%Y-%m-%d')
+                period_years = (end - start).days / 365.25
+            except:
+                period_years = len(yearly_stats)
+        else:
+            period_years = len(yearly_stats)
+
         return {
             'company_info': company_info,
             'summary_stats': {
                 'total_disclosures': total_disclosures,
                 'date_range': date_range,
-                'analysis_period_years': len(yearly_stats),
-                'average_disclosures_per_year': total_disclosures / max(len(yearly_stats), 1)
+                'analysis_period_years': round(period_years, 1),
+                'average_disclosures_per_year': round(total_disclosures / max(period_years, 1), 1)
             },
             'category_distribution': dict(category_stats.most_common()),
             'yearly_trend': dict(yearly_stats),
@@ -374,7 +496,7 @@ class StockBasedDataOrganizer:
             }
         return {'start_date': '', 'end_date': ''}
 
-    def save_stock_data_to_s3(self, stock_code: str, disclosures: List[Dict]) -> bool:
+    def save_stock_data_to_s3(self, stock_code: str, disclosures: List[Dict], is_update: bool = False) -> bool:
         """銘柄別データをS3に保存"""
         try:
             sorted_disclosures = sorted(disclosures, key=lambda x: x.get('date_normalized', ''))
@@ -385,7 +507,8 @@ class StockBasedDataOrganizer:
                     'stock_code': stock_code,
                     'created_at': datetime.now().isoformat(),
                     'data_version': '1.0',
-                    'source': '株探5年分データ'
+                    'source': '株探5年分データ',
+                    'last_updated': datetime.now().isoformat()
                 },
                 'summary': summary,
                 'disclosures': sorted_disclosures
@@ -403,8 +526,13 @@ class StockBasedDataOrganizer:
             )
 
             file_size_kb = len(json_data) / 1024
-            self.logger.info(f"保存完了: {stock_code} ({len(sorted_disclosures)}件, {file_size_kb:.1f}KB)")
-            self.stats['created_files'] += 1
+            action = "更新" if is_update else "作成"
+            self.logger.info(f"{action}完了: {stock_code} ({len(sorted_disclosures)}件, {file_size_kb:.1f}KB)")
+            
+            if is_update:
+                self.stats['updated_files'] += 1
+            else:
+                self.stats['created_files'] += 1
 
             return True
 
@@ -451,25 +579,47 @@ class StockBasedDataOrganizer:
         except Exception as e:
             self.logger.error(f"インデックスファイル作成エラー: {e}")
 
-    def process_stocks_in_batches(self, stock_data: Dict[str, List[Dict]]):
-        """銘柄データをバッチ処理"""
-        stock_codes = list(stock_data.keys())
+    def process_stocks_in_batches(self, new_stock_data: Dict[str, List[Dict]], batch_size: int = 50):
+        """銘柄データをバッチ処理（モード別処理）"""
+        stock_codes = list(new_stock_data.keys())
         total_stocks = len(stock_codes)
 
-        self.logger.info(f"銘柄データ処理開始: {total_stocks}銘柄")
+        self.logger.info(f"\n銘柄データ処理開始: {total_stocks:,}銘柄 (mode={self.mode})")
 
         for i, stock_code in enumerate(stock_codes, 1):
             try:
-                self.logger.info(f"[{i}/{total_stocks}] 処理中: {stock_code}")
-                success = self.save_stock_data_to_s3(stock_code, stock_data[stock_code])
+                if self.mode == 'incremental':
+                    # 差分更新モード：既存データを読み込んでマージ
+                    existing_data = self.load_existing_stock_data(stock_code)
+                    
+                    if existing_data and 'disclosures' in existing_data:
+                        # 既存データあり：マージ
+                        existing_disclosures = existing_data['disclosures']
+                        new_disclosures = new_stock_data[stock_code]
+                        merged_disclosures = self.merge_disclosures(existing_disclosures, new_disclosures)
+                        
+                        if len(merged_disclosures) > len(existing_disclosures):
+                            # 新規データがあった場合のみ保存
+                            self.logger.info(f"[{i}/{total_stocks}] 更新: {stock_code} (+{len(merged_disclosures)-len(existing_disclosures)}件)")
+                            self.save_stock_data_to_s3(stock_code, merged_disclosures, is_update=True)
+                        else:
+                            # 新規データなし
+                            self.logger.info(f"[{i}/{total_stocks}] スキップ: {stock_code} (変更なし)")
+                    else:
+                        # 既存データなし：新規作成
+                        self.logger.info(f"[{i}/{total_stocks}] 新規作成: {stock_code}")
+                        self.save_stock_data_to_s3(stock_code, new_stock_data[stock_code], is_update=False)
+                
+                else:
+                    # フルモード：常に上書き
+                    self.logger.info(f"[{i}/{total_stocks}] 処理: {stock_code}")
+                    self.save_stock_data_to_s3(stock_code, new_stock_data[stock_code], is_update=False)
 
-                if not success:
-                    self.logger.warning(f"保存失敗: {stock_code}")
-
+                # 進捗表示
                 if i % 100 == 0:
                     elapsed = time.time() - self.stats['start_time']
                     progress = i / total_stocks * 100
-                    self.logger.info(f"進捗: {progress:.1f}% ({i}/{total_stocks}) - 経過時間: {elapsed/60:.1f}分")
+                    self.logger.info(f"  進捗: {progress:.1f}% ({i}/{total_stocks}) - 経過時間: {elapsed/60:.1f}分")
 
                 time.sleep(0.1)
 
@@ -480,100 +630,218 @@ class StockBasedDataOrganizer:
         self.logger.info("銘柄データ処理完了")
 
     def run_stock_based_organization(self):
-        """銘柄別データ整理の実行（当月と前月のみ）"""
+        """銘柄別データ整理の実行"""
         print("=" * 80)
-        print("株探データ銘柄別整理システム（日次版）")
+        print(f"株探データ銘柄別整理システム (mode={self.mode})")
         print("=" * 80)
 
         self.stats['start_time'] = time.time()
 
         try:
-            # 対象月を決定
-            target_months = self.get_target_months()
-            print(f"対象月: {target_months[0][0]}年{target_months[0][1]}月 と {target_months[1][0]}年{target_months[1][1]}月")
-
-            # 対象月のデータのみ読み込み
-            self.logger.info("Step 1: 対象月データ読み込み開始")
-            stock_data = self.load_target_monthly_data(target_months)
+            # Step 1: データ読み込み
+            self.logger.info("Step 1: データ読み込み開始")
+            stock_data = self.load_all_monthly_data()
 
             if not stock_data:
                 self.logger.error("データが読み込めませんでした")
                 return False
 
-            # 銘柄別ファイル作成
-            self.logger.info("Step 2: 銘柄別ファイル作成開始")
+            # Step 2: 統計表示
+            if self.mode == 'full':
+                self.logger.info("Step 2: データ統計")
+                self.display_statistics(stock_data)
+
+            # Step 3: 銘柄別ファイル作成/更新
+            self.logger.info("Step 3: 銘柄別ファイル処理開始")
             self.process_stocks_in_batches(stock_data)
 
-            # インデックス作成
-            self.logger.info("Step 3: マスターインデックス作成")
-            self.create_master_index(stock_data)
+            # Step 4: インデックス作成（fullモード時のみ）
+            if self.mode == 'full':
+                self.logger.info("Step 4: マスターインデックス作成")
+                self.create_master_index(stock_data)
 
-            # 完了レポート
-            elapsed_time = time.time() - self.stats['start_time']
-
-            print("\n" + "=" * 80)
-            print("銘柄別データ整理完了レポート")
-            print("=" * 80)
-            print(f"処理時間: {elapsed_time/60:.1f}分")
-            print(f"処理月数: {self.stats['processed_months']}")
-            print(f"対象銘柄数: {self.stats['unique_stocks']:,}")
-            print(f"総開示件数: {self.stats['total_disclosures']:,}")
-            print(f"作成ファイル数: {self.stats['created_files']:,}")
-            print(f"エラー件数: {self.stats['errors']}")
-
-            if self.stats['created_files'] > 0:
-                print(f"平均処理時間/銘柄: {elapsed_time/self.stats['created_files']:.2f}秒")
-
-            print(f"\n保存先: s3://{self.bucket_name}/{self.output_prefix}")
-            print("=" * 80)
+            # Step 5: 完了レポート
+            self.display_completion_report()
 
             return True
 
         except Exception as e:
             self.logger.error(f"実行エラー: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
-def notify_slack(status, message):
-    """Slackに通知を送る"""
-    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
-    
-    if not slack_webhook_url:
-        print("警告: SLACK_WEBHOOK_URLが設定されていません")
-        return
-    
-    color = "good" if status == "success" else "danger"
-    emoji = "✅" if status == "success" else "❌"
-    
-    payload = {
-        "attachments": [{
-            "color": color,
-            "title": f"{emoji} 銘柄別データ整理",
-            "text": message,
-            "footer": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }]
-    }
-    
-    try:
-        requests.post(slack_webhook_url, json=payload)
-    except Exception as e:
-        print(f"Slack通知エラー: {e}")
+    def display_statistics(self, stock_data: Dict[str, List[Dict]]):
+        """統計情報の表示"""
+        print("\n" + "=" * 60)
+        print("データ統計")
+        print("=" * 60)
+
+        total_stocks = len(stock_data)
+        total_disclosures = sum(len(disclosures) for disclosures in stock_data.values())
+
+        print(f"対象銘柄数: {total_stocks:,}")
+        print(f"総開示件数: {total_disclosures:,}")
+        print(f"銘柄平均開示件数: {total_disclosures / max(total_stocks, 1):.1f}")
+
+        # 上位銘柄（開示件数順）
+        top_stocks = sorted(
+            [(code, len(disclosures)) for code, disclosures in stock_data.items()],
+            key=lambda x: x[1],
+            reverse=True
+        )[:10]
+
+        print("\n【開示件数上位10銘柄】")
+        for i, (stock_code, count) in enumerate(top_stocks, 1):
+            company_name = "不明"
+            if stock_data[stock_code]:
+                latest = stock_data[stock_code][0]
+                company_name = latest.get('company_name_cleaned') or latest.get('company_name', '不明')
+            print(f"  {i:2d}. {stock_code} ({company_name}): {count:,}件")
+
+    def display_completion_report(self):
+        """完了レポートの表示"""
+        elapsed_time = time.time() - self.stats['start_time']
+
+        print("\n" + "=" * 80)
+        print("銘柄別データ整理完了レポート")
+        print("=" * 80)
+        print(f"実行モード: {self.mode}")
+        print(f"処理時間: {elapsed_time/60:.1f}分")
+        print(f"処理月数: {self.stats['processed_months']}")
+        print(f"対象銘柄数: {self.stats['unique_stocks']:,}")
+        print(f"読込開示件数: {self.stats['total_disclosures']:,}")
+        
+        if self.mode == 'incremental':
+            print(f"新規開示件数: {self.stats['new_disclosures']:,}")
+            print(f"重複除外件数: {self.stats['duplicate_disclosures']:,}")
+            print(f"更新ファイル数: {self.stats['updated_files']:,}")
+            print(f"新規ファイル数: {self.stats['created_files']:,}")
+        else:
+            print(f"作成ファイル数: {self.stats['created_files']:,}")
+        
+        print(f"エラー件数: {self.stats['errors']}")
+
+        if (self.stats['created_files'] + self.stats['updated_files']) > 0:
+            total_files = self.stats['created_files'] + self.stats['updated_files']
+            print(f"平均処理時間/銘柄: {elapsed_time/total_files:.2f}秒")
+
+        print(f"\n保存先: s3://{self.bucket_name}/{self.output_prefix}")
+        print("=" * 80)
+
+    def get_sample_stock_data(self, stock_code: str = "1301") -> Dict:
+        """サンプル銘柄データの取得（デバッグ用）"""
+        try:
+            key = f"{self.output_prefix}{stock_code}.json"
+            response = self.s3.get_object(Bucket=self.bucket_name, Key=key)
+            data = json.loads(response['Body'].read().decode('utf-8'))
+            return data
+        except Exception as e:
+            self.logger.error(f"サンプルデータ取得エラー ({stock_code}): {e}")
+            return {}
 
 
 def main():
-    """メイン実行関数"""
+    """メイン実行関数（Colab対応版）"""
+    # 環境変数またはデフォルトでモードを決定
+    mode = os.getenv('STOCK_ORGANIZER_MODE', 'full')
+    
     try:
-        organizer = StockBasedDataOrganizer()
+        organizer = StockBasedDataOrganizer(mode=mode)
         success = organizer.run_stock_based_organization()
-        
+
         if success:
-            print("銘柄別データ整理が正常に完了しました")
-            notify_slack("success", "銘柄別データ整理が正常に完了しました")
+            print(f"✅ 銘柄別データ整理が正常に完了しました (mode={mode})")
+
+            # サンプル表示
+            if mode == 'full':
+                print(f"\nサンプル: 銘柄1301のデータ構造")
+                sample = organizer.get_sample_stock_data("1301")
+                if sample and 'summary' in sample:
+                    summary = sample['summary']
+                    print(f"  会社名: {summary.get('company_info', {}).get('company_name', '不明')}")
+                    print(f"  開示件数: {summary.get('summary_stats', {}).get('total_disclosures', 0)}件")
+                    print(f"  期間: {summary.get('summary_stats', {}).get('date_range', {})}")
         else:
-            print("処理中にエラーが発生しました")
-            notify_slack("failure", "処理中にエラーが発生しました")
+            print("❌ 処理中にエラーが発生しました")
+
     except Exception as e:
-        print(f"実行エラー: {e}")
-        notify_slack("failure", f"実行エラー: {str(e)}")
+        print(f"❌ 実行エラー: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+# Colab用の直接実行関数
+def run_debug_path():
+    """S3パス確認用関数（Colab直接実行用）"""
+    organizer = StockBasedDataOrganizer()
+
+    print("S3パス確認モード")
+    print(f"バケット: {organizer.bucket_name}")
+    print(f"取得パス: {organizer.source_prefix}")
+    print(f"出力パス: {organizer.output_prefix}")
+
+    try:
+        paginator = organizer.s3.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=organizer.bucket_name, Prefix=organizer.source_prefix)
+
+        print(f"\n{organizer.source_prefix} 内のファイル:")
+        file_count = 0
+        for page in pages:
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    print(f"  {obj['Key']}")
+                    file_count += 1
+                    if file_count >= 10:
+                        break
+            if file_count >= 10:
+                break
+
+        if file_count == 0:
+            print("  ファイルが見つかりません")
+        else:
+            print(f"  総計: {file_count}+ 件のファイル")
+
+    except Exception as e:
+        print(f"S3アクセスエラー: {e}")
+
+
+def run_full():
+    """フルモード実行用（Colab直接実行用）"""
+    os.environ['STOCK_ORGANIZER_MODE'] = 'full'
+    organizer = StockBasedDataOrganizer(mode='full')
+    success = organizer.run_stock_based_organization()
+    
+    if success:
+        print("✅ フルモード処理が正常に完了しました")
+    else:
+        print("❌ 処理中にエラーが発生しました")
+
+
+def run_incremental():
+    """差分更新モード実行用（Colab直接実行用）"""
+    os.environ['STOCK_ORGANIZER_MODE'] = 'incremental'
+    organizer = StockBasedDataOrganizer(mode='incremental')
+    success = organizer.run_stock_based_organization()
+    
+    if success:
+        print("✅ 差分更新が正常に完了しました")
+    else:
+        print("❌ 処理中にエラーが発生しました")
+
+
+def get_sample(stock_code="1301"):
+    """サンプルデータ取得用関数（Colab直接実行用）"""
+    organizer = StockBasedDataOrganizer()
+
+    print(f"銘柄 {stock_code} のサンプルデータ:")
+    sample_data = organizer.get_sample_stock_data(stock_code)
+    if sample_data:
+        print(json.dumps(sample_data, ensure_ascii=False, indent=2)[:2000] + "...")
+    else:
+        print("サンプルデータが見つかりません")
+
 
 if __name__ == "__main__":
     main()
+    
