@@ -1,4 +1,4 @@
-# JPX全銘柄5年分株価データ収集システム - 配当日・動的時価総額対応版
+# JPX全銘柄5年分株価データ収集システム - 配当日・動的時価総額・市場区分対応版
 
 import yfinance as yf
 import pandas as pd
@@ -28,6 +28,7 @@ class JPXStockCollector:
         self.jpx_symbols = []
         self.stock_data = {}
         self.failed_symbols = []
+        self.symbol_metadata = {}  # 🆕 JPXメタデータ保存用
         self.lock = threading.Lock()
         self.s3_client = None
 
@@ -113,83 +114,125 @@ class JPXStockCollector:
             return None
 
     def _extract_symbols(self, df):
-        """銘柄コード抽出 - 英字銘柄対応"""
+        """銘柄コード抽出 - 英字銘柄対応 + 市場区分・業種取得"""
         print(f"銘柄コード抽出開始: {df.shape}")
         print(f"列名: {list(df.columns)}")
         print("データサンプル:")
         print(df.head(3))
 
-        symbols = set()
+        symbols = {}  # 🆕 setからdictに変更
         import re
 
-        for col_idx, col in enumerate(df.columns):
-            col_symbols = []
+        # 🆕 列名を探す
+        code_col = None
+        name_col = None
+        market_col = None
+        sector_33_col = None
+        sector_17_col = None
+        size_col = None
 
-            for value in df[col].dropna():
-                value_str = str(value).strip()
+        for col in df.columns:
+            col_str = str(col)
+            if 'コード' in col_str and '業種' not in col_str and '規模' not in col_str:
+                if code_col is None:
+                    code_col = col
+            elif '銘柄名' in col_str:
+                name_col = col
+            elif '市場' in col_str or 'Market' in col_str:
+                market_col = col
+            elif '33業種区分' in col_str:
+                sector_33_col = col
+            elif '17業種区分' in col_str:
+                sector_17_col = col
+            elif '規模区分' in col_str:
+                size_col = col
 
-                # パターン1: 4桁数値のみ
-                if value_str.isdigit() and len(value_str) == 4:
-                    code = int(value_str)
+        print(f"\n🔍 検出された列:")
+        print(f"  コード列: {code_col}")
+        print(f"  銘柄名列: {name_col}")
+        print(f"  市場区分列: {market_col}")
+        print(f"  33業種区分列: {sector_33_col}")
+        print(f"  17業種区分列: {sector_17_col}")
+        print(f"  規模区分列: {size_col}")
+
+        # データ抽出
+        for idx, row in df.iterrows():
+            try:
+                # 銘柄コード取得
+                if code_col is None:
+                    continue
+                    
+                code_value = str(row[code_col]).strip()
+                if not code_value or code_value == 'nan':
+                    continue
+
+                # 4桁数値のみ
+                if code_value.isdigit() and len(code_value) == 4:
+                    code = int(code_value)
                     if 1000 <= code <= 9999:
-                        col_symbols.append(f"{value_str}.T")
-                        symbols.add(f"{value_str}.T")
-
-                # パターン2: 数字+英字（130A, 1475BXなど）
-                elif re.match(r'^\d{3,4}[A-Z]{1,2}$', value_str):
-                    col_symbols.append(f"{value_str}.T")
-                    symbols.add(f"{value_str}.T")
-
-                # パターン3: 小数点付き
-                elif '.' in value_str:
-                    parts = value_str.split('.')
-                    if len(parts) >= 2:
-                        code_part = parts[0]
+                        symbol = f"{code_value}.T"
                         
-                        # 数値のみ
-                        if code_part.isdigit() and len(code_part) == 4:
-                            code = int(code_part)
-                            if 1000 <= code <= 9999:
-                                col_symbols.append(f"{code_part}.T")
-                                symbols.add(f"{code_part}.T")
-                        
-                        # 数字+英字
-                        elif re.match(r'^\d{3,4}[A-Z]{1,2}$', code_part):
-                            col_symbols.append(f"{code_part}.T")
-                            symbols.add(f"{code_part}.T")
+                        # 🆕 追加情報を取得
+                        symbols[symbol] = {
+                            'code': code_value,
+                            'name': str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else 'N/A',
+                            'market': str(row[market_col]).strip() if market_col and pd.notna(row[market_col]) else 'N/A',
+                            'sector_33': str(row[sector_33_col]).strip() if sector_33_col and pd.notna(row[sector_33_col]) else 'N/A',
+                            'sector_17': str(row[sector_17_col]).strip() if sector_17_col and pd.notna(row[sector_17_col]) else 'N/A',
+                            'size': str(row[size_col]).strip() if size_col and pd.notna(row[size_col]) else 'N/A',
+                        }
+                
+                # 数字+英字（130A, 1475BXなど）
+                elif re.match(r'^\d{3,4}[A-Z]{1,2}$', code_value):
+                    symbol = f"{code_value}.T"
+                    symbols[symbol] = {
+                        'code': code_value,
+                        'name': str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else 'N/A',
+                        'market': str(row[market_col]).strip() if market_col and pd.notna(row[market_col]) else 'N/A',
+                        'sector_33': str(row[sector_33_col]).strip() if sector_33_col and pd.notna(row[sector_33_col]) else 'N/A',
+                        'sector_17': str(row[sector_17_col]).strip() if sector_17_col and pd.notna(row[sector_17_col]) else 'N/A',
+                        'size': str(row[size_col]).strip() if size_col and pd.notna(row[size_col]) else 'N/A',
+                    }
 
-                # パターン4: 正規表現で4桁数値抽出
-                matches = re.findall(r'\b(\d{4})\b', value_str)
-                for match in matches:
-                    code = int(match)
-                    if 1000 <= code <= 9999:
-                        col_symbols.append(f"{match}.T")
-                        symbols.add(f"{match}.T")
+            except Exception as e:
+                continue
 
-            if col_symbols:
-                print(f"列 {col_idx} '{col}': {len(col_symbols)} 銘柄抽出")
-                if len(col_symbols) > 10:
-                    print(f"  例: {col_symbols[:5]}")
-
-        result = sorted(list(symbols))
+        result = sorted(list(symbols.keys()))
         
-        # 英字銘柄の集計表示
+        # 統計表示
         alphabetic = [s for s in result if re.search(r'[A-Z]', s.replace('.T', ''))]
         numeric_only = [s for s in result if not re.search(r'[A-Z]', s.replace('.T', ''))]
+        
+        # 🆕 市場区分別の統計
+        markets = {}
+        for symbol, info in symbols.items():
+            market = info['market']
+            if market not in markets:
+                markets[market] = 0
+            markets[market] += 1
         
         print(f"\n最終抽出結果: 合計 {len(result)} 銘柄")
         print(f"  数値のみ: {len(numeric_only)} 銘柄")
         if alphabetic:
             print(f"  英字付き: {len(alphabetic)} 銘柄")
-            print(f"  英字例: {alphabetic[:10]}")
+        
+        print(f"\n📊 市場区分別:")
+        for market, count in sorted(markets.items()):
+            print(f"  {market}: {count}銘柄")
 
         if result:
-            print(f"抽出例: {result[:10]}")
+            print(f"\n抽出例（詳細）:")
+            for symbol in result[:5]:
+                info = symbols[symbol]
+                print(f"  {symbol}: {info['name']} | {info['market']} | {info['sector_17']}")
+
+        # 🆕 symbolsをインスタンス変数に保存
+        self.symbol_metadata = symbols
 
         return result
 
     def get_stock_data_safe(self, symbol):
-        """安全な株価データ取得（配当日・動的時価総額対応）"""
+        """安全な株価データ取得（配当日・動的時価総額・追加指標対応）"""
         try:
             time.sleep(self.config["request_delay"])
 
@@ -219,19 +262,45 @@ class JPXStockCollector:
                     else:
                         data['時価総額'] = None
 
+                # 🆕 52週高値・安値を計算
+                if len(data) >= 252:
+                    week_52_high = data['High'].tail(252).max()
+                    week_52_low = data['Low'].tail(252).min()
+                else:
+                    week_52_high = None
+                    week_52_low = None
+
                 company_info = {
                     'name': info.get('longName', info.get('shortName', 'N/A')),
                     'sector': info.get('sector', 'N/A'),
+                    'industry': info.get('industry', 'N/A'),  # 🆕 業種詳細
                     'market_cap': info.get('marketCap', None),
-                    'shares_outstanding': shares_outstanding
+                    'shares_outstanding': shares_outstanding,
+                    
+                    # 🆕 バリュエーション指標
+                    'trailing_pe': info.get('trailingPE', None),  # PER
+                    'price_to_book': info.get('priceToBook', None),  # PBR
+                    'beta': info.get('beta', None),  # ベータ値
+                    'dividend_yield': info.get('dividendYield', None),  # 配当利回り
+                    
+                    # 🆕 52週高値・安値
+                    'week_52_high': week_52_high,
+                    'week_52_low': week_52_low,
                 }
             except:
                 data['時価総額'] = None
                 company_info = {
                     'name': 'N/A',
                     'sector': 'N/A',
+                    'industry': 'N/A',
                     'market_cap': None,
-                    'shares_outstanding': None
+                    'shares_outstanding': None,
+                    'trailing_pe': None,
+                    'price_to_book': None,
+                    'beta': None,
+                    'dividend_yield': None,
+                    'week_52_high': None,
+                    'week_52_low': None,
                 }
 
             # 配当データ取得
@@ -377,34 +446,120 @@ class JPXStockCollector:
         return True
 
     def _save_summary_to_s3(self):
-        """サマリーをS3保存"""
+        """サマリーをS3保存 - 統計指標・市場区分追加版"""
         try:
             summary_data = []
 
             for symbol, data_info in self.stock_data.items():
                 price_data = data_info['price_data']
                 company_info = data_info['company_info']
+                
+                # 🆕 JPXメタデータ取得
+                jpx_meta = self.symbol_metadata.get(symbol, {})
 
+                # 基本情報
                 first_price = price_data['Close'].iloc[0]
                 latest_price = price_data['Close'].iloc[-1]
                 total_return = (latest_price / first_price - 1) * 100
 
+                # 配当情報
                 dividend_count = len(price_data[price_data['配当金額'] > 0])
                 total_dividends = price_data['配当金額'].sum()
 
+                # 🆕 統計指標計算
+                try:
+                    returns = price_data['Close'].pct_change().dropna()
+                    returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+                    
+                    if len(returns) > 50:
+                        # ボラティリティ（年率）
+                        volatility = returns.std() * np.sqrt(252)
+                        
+                        # 年率リターン
+                        annual_return = returns.mean() * 252
+                        
+                        # シャープレシオ
+                        sharpe_ratio = annual_return / volatility if volatility > 0 else 0
+                        
+                        # 最大ドローダウン
+                        cumulative = (1 + returns).cumprod()
+                        running_max = cumulative.expanding().max()
+                        drawdown = (cumulative - running_max) / running_max
+                        max_drawdown = drawdown.min()
+                        
+                        # 平均売買代金
+                        trading_values = price_data['Close'] * price_data['Volume']
+                        avg_trading_value = trading_values.mean()
+                    else:
+                        volatility = None
+                        annual_return = None
+                        sharpe_ratio = None
+                        max_drawdown = None
+                        avg_trading_value = None
+                        
+                except Exception as e:
+                    volatility = None
+                    annual_return = None
+                    sharpe_ratio = None
+                    max_drawdown = None
+                    avg_trading_value = None
+
+                # 🆕 配当利回り計算
+                if company_info.get('dividend_yield') is None and total_dividends > 0:
+                    annual_dividend = total_dividends / 5
+                    calculated_yield = (annual_dividend / latest_price) if latest_price > 0 else 0
+                else:
+                    calculated_yield = company_info.get('dividend_yield')
+
                 summary_data.append({
                     '銘柄コード': symbol.replace('.T', ''),
-                    '会社名': company_info.get('name', 'N/A'),
-                    'セクター': company_info.get('sector', 'N/A'),
+                    '会社名': jpx_meta.get('name', company_info.get('name', 'N/A')),
+                    
+                    # 🆕 JPX情報
+                    '市場区分': jpx_meta.get('market', 'N/A'),
+                    '33業種区分': jpx_meta.get('sector_33', 'N/A'),
+                    '17業種区分': jpx_meta.get('sector_17', 'N/A'),
+                    '規模区分': jpx_meta.get('size', 'N/A'),
+                    
+                    # yfinance情報
+                    'セクター（YF）': company_info.get('sector', 'N/A'),
+                    '業種（YF）': company_info.get('industry', 'N/A'),
+                    
+                    # 期間情報
                     '期間開始': str(price_data.index[0].date()),
                     '期間終了': str(price_data.index[-1].date()),
                     'データ日数': len(price_data),
+                    
+                    # 価格情報
                     '開始価格': round(first_price, 2) if first_price else None,
                     '最新価格': round(latest_price, 2) if latest_price else None,
+                    '52週高値': round(company_info.get('week_52_high'), 2) if company_info.get('week_52_high') else None,
+                    '52週安値': round(company_info.get('week_52_low'), 2) if company_info.get('week_52_low') else None,
+                    
+                    # リターン指標
                     '5年変化率(%)': round(total_return, 2) if total_return else None,
+                    '年率リターン(%)': round(annual_return * 100, 2) if annual_return is not None and not np.isnan(annual_return) else None,
+                    
+                    # リスク指標
+                    'ボラティリティ(%)': round(volatility * 100, 2) if volatility is not None and not np.isnan(volatility) else None,
+                    'シャープレシオ': round(sharpe_ratio, 2) if sharpe_ratio is not None and not np.isnan(sharpe_ratio) else None,
+                    '最大DD(%)': round(max_drawdown * 100, 2) if max_drawdown is not None and not np.isnan(max_drawdown) else None,
+                    
+                    # バリュエーション
+                    'PER': round(company_info.get('trailing_pe'), 2) if company_info.get('trailing_pe') else None,
+                    'PBR': round(company_info.get('price_to_book'), 2) if company_info.get('price_to_book') else None,
+                    'ベータ': round(company_info.get('beta'), 2) if company_info.get('beta') else None,
+                    
+                    # 流動性指標
                     '平均出来高': int(price_data['Volume'].mean()) if not price_data['Volume'].isna().all() else None,
+                    '平均売買代金': int(avg_trading_value) if avg_trading_value is not None and not np.isnan(avg_trading_value) else None,
+                    
+                    # 配当情報
                     '配当回数': dividend_count,
                     '総配当額': round(total_dividends, 2) if total_dividends > 0 else 0,
+                    '配当利回り(%)': round(calculated_yield * 100, 2) if calculated_yield and not np.isnan(calculated_yield) else None,
+                    
+                    # 企業情報
                     '最新時価総額': price_data['時価総額'].iloc[-1] if price_data['時価総額'].iloc[-1] else None
                 })
 
@@ -420,6 +575,7 @@ class JPXStockCollector:
 
             print("サマリー保存完了: summary.csv")
 
+            # 統計表示
             total_stocks = len(summary_df)
             positive_returns = len(summary_df[summary_df['5年変化率(%)'] > 0])
             dividend_stocks = len(summary_df[summary_df['配当回数'] > 0])
@@ -428,12 +584,18 @@ class JPXStockCollector:
             print(f"  総銘柄数: {total_stocks}")
             print(f"  プラスリターン: {positive_returns}/{total_stocks} ({positive_returns/total_stocks*100:.1f}%)")
             print(f"  配当支払い銘柄: {dividend_stocks}/{total_stocks} ({dividend_stocks/total_stocks*100:.1f}%)")
+            
             if len(summary_df) > 0:
                 print(f"  平均5年リターン: {summary_df['5年変化率(%)'].mean():.2f}%")
+                print(f"  平均年率リターン: {summary_df['年率リターン(%)'].mean():.2f}%")
+                print(f"  平均ボラティリティ: {summary_df['ボラティリティ(%)'].mean():.2f}%")
+                print(f"  平均シャープレシオ: {summary_df['シャープレシオ'].mean():.2f}")
                 print(f"  平均配当回数: {summary_df['配当回数'].mean():.1f}回")
 
         except Exception as e:
             print(f"サマリー保存エラー: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def run_safe_collection():
