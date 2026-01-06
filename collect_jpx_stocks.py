@@ -1,4 +1,14 @@
 # JPX全銘柄5年分株価データ収集システム - 配当日・動的時価総額・市場区分対応版
+import os
+import sys
+
+print("========== DEBUG ==========")
+print("MAIN FILE:", __file__)
+print("CWD:", os.getcwd())
+print("sys.path:")
+for p in sys.path:
+    print(" ", p)
+print("===========================")
 
 import yfinance as yf
 import pandas as pd
@@ -6,7 +16,6 @@ import numpy as np
 import requests
 import io
 import time
-import os
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
