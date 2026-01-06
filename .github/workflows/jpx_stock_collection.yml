@@ -12,11 +12,20 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Debug workspace
+        run: |
+          echo "PWD:"
+          pwd
+          echo "FILES:"
+          ls -R
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
       
-      - run: |
+      - name: Install dependencies
+        run: |
           pip install yfinance pandas numpy requests tqdm xlrd python-calamine openpyxl boto3
       
       - name: Run Collection
