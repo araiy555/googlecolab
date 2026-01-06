@@ -454,137 +454,140 @@ class JPXStockCollector:
 
         return True
 
-def _save_summary_to_s3(self):
-    """サマリーをS3保存 - 全指標フル版（既存構造維持）"""
-    try:
-        summary_data = []
+    def _save_summary_to_s3(self):
+        """サマリーCSVをS3に保存（全指標）"""
+        try:
+            summary_data = []
 
-        for symbol, data_info in self.stock_data.items():
-            price_data = data_info['price_data']
-            company_info = data_info['company_info']
-            jpx_meta = self.symbol_metadata.get(symbol, {})
+            for symbol, data_info in self.stock_data.items():
+                price_data = data_info.get('price_data')
+                company_info = data_info.get('company_info', {})
+                jpx_meta = self.symbol_metadata.get(symbol, {})
 
-            if price_data is None or len(price_data) < 100:
-                continue
+                if price_data is None or len(price_data) < 100:
+                    continue
 
-            # ===== 基本価格 =====
-            first_price = price_data['Close'].iloc[0]
-            latest_price = price_data['Close'].iloc[-1]
-            high_price = price_data['High'].max()
-            low_price = price_data['Low'].min()
-            total_return = (latest_price / first_price - 1) * 100
-
-            # ===== リターン =====
-            returns = price_data['Close'].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-
-            if len(returns) > 50:
-                volatility = returns.std() * np.sqrt(252)
-                annual_return = returns.mean() * 252
-                sharpe_ratio = annual_return / volatility if volatility > 0 else None
-
-                cumulative = (1 + returns).cumprod()
-                running_max = cumulative.cummax()
-                drawdown = (cumulative - running_max) / running_max
-                max_drawdown = drawdown.min()
-            else:
-                volatility = annual_return = sharpe_ratio = max_drawdown = None
-
-            # ===== 出来高・売買代金 =====
-            trading_value = price_data['Close'] * price_data['Volume']
-
-            # ===== 配当 =====
-            dividends = price_data[price_data['配当金額'] > 0]['配当金額']
-            dividend_count = len(dividends)
-            total_dividends = dividends.sum()
-
-            if company_info.get('dividend_yield') is None and total_dividends > 0:
-                annual_dividend = total_dividends / 5
-                dividend_yield = (annual_dividend / latest_price) * 100 if latest_price > 0 else None
-            else:
-                dividend_yield = company_info.get('dividend_yield')
-                dividend_yield = dividend_yield * 100 if dividend_yield else None
-
-            summary_data.append({
-                # ===== 銘柄 =====
-                '銘柄コード': symbol.replace('.T', ''),
-                '会社名': jpx_meta.get('name', company_info.get('name')),
-
-                # ===== JPX =====
-                '市場区分': jpx_meta.get('market'),
-                '33業種区分': jpx_meta.get('sector_33'),
-                '17業種区分': jpx_meta.get('sector_17'),
-                '規模区分': jpx_meta.get('size'),
-
-                # ===== YF =====
-                'セクター(YF)': company_info.get('sector'),
-                '業種(YF)': company_info.get('industry'),
-
-                # ===== 期間 =====
-                '期間開始': str(price_data.index[0].date()),
-                '期間終了': str(price_data.index[-1].date()),
-                'データ日数': len(price_data),
-
-                # ===== 価格 =====
-                '開始価格': round(first_price, 2),
-                '最新価格': round(latest_price, 2),
-                '最高値': round(high_price, 2),
-                '最安値': round(low_price, 2),
-                '52週高値': company_info.get('week_52_high'),
-                '52週安値': company_info.get('week_52_low'),
+                # ===== 基本価格 =====
+                first_price = price_data['Close'].iloc[0]
+                latest_price = price_data['Close'].iloc[-1]
+                high_price = price_data['High'].max()
+                low_price = price_data['Low'].min()
+                total_return = (latest_price / first_price - 1) * 100
 
                 # ===== リターン =====
-                '5年変化率(%)': round(total_return, 2),
-                '年率リターン(%)': round(annual_return * 100, 2) if annual_return is not None else None,
+                returns = price_data['Close'].pct_change()
+                returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
 
-                # ===== リスク =====
-                'ボラティリティ(%)': round(volatility * 100, 2) if volatility is not None else None,
-                'シャープレシオ': round(sharpe_ratio, 2) if sharpe_ratio is not None else None,
-                '最大ドローダウン(%)': round(max_drawdown * 100, 2) if max_drawdown is not None else None,
+                if len(returns) > 50:
+                    volatility = returns.std() * np.sqrt(252)
+                    annual_return = returns.mean() * 252
+                    sharpe_ratio = annual_return / volatility if volatility > 0 else None
 
-                # ===== バリュエーション =====
-                'PER': company_info.get('trailing_pe'),
-                'PBR': company_info.get('price_to_book'),
-                'ベータ': company_info.get('beta'),
+                    cumulative = (1 + returns).cumprod()
+                    running_max = cumulative.cummax()
+                    drawdown = (cumulative - running_max) / running_max
+                    max_drawdown = drawdown.min()
+                else:
+                    volatility = None
+                    annual_return = None
+                    sharpe_ratio = None
+                    max_drawdown = None
 
-                # ===== 流動性 =====
-                '平均出来高': int(price_data['Volume'].mean()),
-                '中央値出来高': int(price_data['Volume'].median()),
-                '平均売買代金': int(trading_value.mean()),
-                '中央値売買代金': int(trading_value.median()),
+                # ===== 出来高・売買代金 =====
+                trading_value = price_data['Close'] * price_data['Volume']
 
                 # ===== 配当 =====
-                '配当回数': dividend_count,
-                '総配当額': round(total_dividends, 2),
-                '配当利回り(%)': round(dividend_yield, 2) if dividend_yield else None,
+                dividend_rows = price_data[price_data['配当金額'] > 0]
+                dividend_count = len(dividend_rows)
+                total_dividends = dividend_rows['配当金額'].sum()
 
-                # ===== 時価総額 =====
-                '最新時価総額': price_data['時価総額'].iloc[-1],
-                '平均時価総額': price_data['時価総額'].mean(),
+                if company_info.get('dividend_yield') is None and total_dividends > 0:
+                    annual_dividend = total_dividends / 5
+                    dividend_yield = (annual_dividend / latest_price) * 100 if latest_price > 0 else None
+                else:
+                    dividend_yield = company_info.get('dividend_yield')
+                    dividend_yield = dividend_yield * 100 if dividend_yield else None
 
-                # ===== 勝率 =====
-                '上昇日数': int((returns > 0).sum()),
-                '下落日数': int((returns < 0).sum()),
-                '勝率(%)': round((returns > 0).mean() * 100, 2),
-                '価格出来高相関': price_data['Close'].corr(price_data['Volume']),
-            })
+                summary_data.append({
+                    # ===== 銘柄 =====
+                    '銘柄コード': symbol.replace('.T', ''),
+                    '会社名': jpx_meta.get('name', company_info.get('name', 'N/A')),
 
-        summary_df = pd.DataFrame(summary_data)
+                    # ===== JPX =====
+                    '市場区分': jpx_meta.get('market', 'N/A'),
+                    '33業種区分': jpx_meta.get('sector_33', 'N/A'),
+                    '17業種区分': jpx_meta.get('sector_17', 'N/A'),
+                    '規模区分': jpx_meta.get('size', 'N/A'),
 
-        csv_data = summary_df.to_csv(index=False, encoding='utf-8-sig')
+                    # ===== YF =====
+                    'セクター(YF)': company_info.get('sector', 'N/A'),
+                    '業種(YF)': company_info.get('industry', 'N/A'),
 
-        self.s3_client.put_object(
-            Bucket="m-s3storage",
-            Key="japan-stocks-5years-chart/summary.csv",
-            Body=csv_data.encode('utf-8'),
-            ContentType='text/csv'
-        )
+                    # ===== 期間 =====
+                    '期間開始': str(price_data.index[0].date()),
+                    '期間終了': str(price_data.index[-1].date()),
+                    'データ日数': len(price_data),
 
-        print(f"サマリー保存完了: {len(summary_df)} 銘柄")
+                    # ===== 価格 =====
+                    '開始価格': round(first_price, 2),
+                    '最新価格': round(latest_price, 2),
+                    '最高値': round(high_price, 2),
+                    '最安値': round(low_price, 2),
+                    '52週高値': company_info.get('week_52_high'),
+                    '52週安値': company_info.get('week_52_low'),
 
-    except Exception as e:
-        print("サマリー保存エラー:", e)
-        import traceback
-        traceback.print_exc()
+                    # ===== リターン =====
+                    '5年変化率(%)': round(total_return, 2),
+                    '年率リターン(%)': round(annual_return * 100, 2) if annual_return is not None else None,
+
+                    # ===== リスク =====
+                    'ボラティリティ(%)': round(volatility * 100, 2) if volatility is not None else None,
+                    'シャープレシオ': round(sharpe_ratio, 2) if sharpe_ratio is not None else None,
+                    '最大ドローダウン(%)': round(max_drawdown * 100, 2) if max_drawdown is not None else None,
+
+                    # ===== バリュエーション =====
+                    'PER': company_info.get('trailing_pe'),
+                    'PBR': company_info.get('price_to_book'),
+                    'ベータ': company_info.get('beta'),
+
+                    # ===== 流動性 =====
+                    '平均出来高': int(price_data['Volume'].mean()),
+                    '中央値出来高': int(price_data['Volume'].median()),
+                    '平均売買代金': int(trading_value.mean()),
+                    '中央値売買代金': int(trading_value.median()),
+
+                    # ===== 配当 =====
+                    '配当回数': dividend_count,
+                    '総配当額': round(total_dividends, 2),
+                    '配当利回り(%)': round(dividend_yield, 2) if dividend_yield else None,
+
+                    # ===== 時価総額 =====
+                    '最新時価総額': price_data['時価総額'].iloc[-1],
+                    '平均時価総額': price_data['時価総額'].mean(),
+
+                    # ===== 勝率 =====
+                    '上昇日数': int((returns > 0).sum()),
+                    '下落日数': int((returns < 0).sum()),
+                    '勝率(%)': round((returns > 0).mean() * 100, 2),
+                    '価格出来高相関': price_data['Close'].corr(price_data['Volume']),
+                })
+
+            summary_df = pd.DataFrame(summary_data)
+            csv_data = summary_df.to_csv(index=False, encoding='utf-8-sig')
+
+            self.s3_client.put_object(
+                Bucket="m-s3storage",
+                Key="japan-stocks-5years-chart/summary.csv",
+                Body=csv_data.encode('utf-8'),
+                ContentType='text/csv'
+            )
+
+            print(f"サマリー保存完了: {len(summary_df)} 銘柄")
+
+        except Exception as e:
+            print("サマリー保存エラー:", e)
+            import traceback
+            traceback.print_exc()
 
 
 def run_safe_collection():
