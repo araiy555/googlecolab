@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
 class JPXStockCollector:
-    """JPX株価データ収集 - レート制限対策・配当日・動的時価総額対応"""
+    """JPX株価データ収集 - レート制限対策・配当日・動的時価総額対応（2026年1月07日）"""
 
     def __init__(self):
         self.jpx_symbols = []
