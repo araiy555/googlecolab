@@ -51,7 +51,7 @@ class JPXStockCollector:
             "chunk_delay": 120
         }
 
-        print("JPX株価収集システム - 配当日・動的時価総額対応版")
+        print("JPX株価収集システム - 配当日・動的時価総額対応版（2026年1月07日）")
         print(f"設定: 並列{self.config['max_workers']}, 待機{self.config['request_delay']}秒, チャンク{self.config['chunk_size']}")
 
     def setup_s3(self):
