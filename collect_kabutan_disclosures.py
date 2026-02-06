@@ -4,7 +4,7 @@
 毎日当月と前月のデータを取得・更新（データ漏れ防止）
 
 修正箇所（3箇所のみ）:
-  1. parse_disclosure_row: len(text) > 5 → len(text) > 1 （短い会社名を拾えるように）
+  1. parse_disclosure_row: 市場名スキップリスト追加（短い会社名を拾いつつ市場名を除外）
   2. parse_disclosure_row: 日付パースを YY/MM/DD 3グループに修正（日の精度喪失を修正）
   3. parse_disclosure_item: ゴミHTML（ページネーション等）を除外するフィルタ追加
 """
@@ -186,8 +186,20 @@ class KabutanDailyCollector:
                     print(f"  最大ページ数到達: {page-1}")
                     break
 
-            print(f"完了: {year}年{month}月 - {len(all_disclosures)}件")
-            return all_disclosures
+            # 重複除去（同じstock_code+date+titleのレコードを1つにまとめる）
+            seen = set()
+            unique_disclosures = []
+            for d in all_disclosures:
+                key = f"{d.get('stock_code')}_{d.get('date')}_{d.get('title')}"
+                if key not in seen:
+                    seen.add(key)
+                    unique_disclosures.append(d)
+            dedup_count = len(all_disclosures) - len(unique_disclosures)
+            if dedup_count > 0:
+                print(f"  重複除去: {dedup_count}件")
+
+            print(f"完了: {year}年{month}月 - {len(unique_disclosures)}件")
+            return unique_disclosures
 
         except Exception as e:
             print(f"エラー: {year}年{month}月 - {e}")
@@ -218,7 +230,7 @@ class KabutanDailyCollector:
     def parse_disclosure_row(self, cells, year, month):
         """テーブル行から開示情報をパース
         
-        🔧 修正1: len(text) > 5 → len(text) > 1
+        🔧 修正1: 市場名スキップリスト追加（短い会社名を拾いつつ市場名を除外）
         🔧 修正2: 日付パースを YY/MM/DD 3グループに変更
         """
         try:
@@ -256,13 +268,18 @@ class KabutanDailyCollector:
                             month_day = date_matches[0]
                             date_info = f"{year}-{month:02d}-{int(month_day[1]):02d}"
 
-                # 🔧 修正1: len(text) > 5 → len(text) > 1
-                # 旧: 「オンリー」(4文字) がスキップされ、タイトルが company_name に入る
-                # 新: 2文字以上なら候補にする
-                if len(text) > 1 and not re.match(r'^\d+$', text):
-                    if not company_name and stock_code:
+                # 🔧 修正1: company_name と title で条件を分ける
+                # 旧: 両方 len > 5 → 「オンリー」(4文字) がスキップされフィールド入替
+                # 新: company_name は len > 1（短い名前OK）+ 市場名除外
+                #     title は len > 5（情報種別「決算」等の短いテキストを除外）
+                MARKET_NAMES = {'東証Ｐ', '東証Ｓ', '東証Ｇ', '東証', '名証',
+                                '名証Ｍ', '名証Ｎ', '福証', '福証Ｑ', '札証',
+                                '札証Ａ', 'JQ', 'マザーズ', 'グロース', 'スタンダード',
+                                'プライム', 'JASDAQ'}
+                if not re.match(r'^\d+$', text):
+                    if not company_name and stock_code and len(text) > 1 and text not in MARKET_NAMES:
                         company_name = text
-                    elif not title:
+                    elif not title and len(text) > 5:
                         title = text
 
             if stock_code:
@@ -374,26 +391,13 @@ class KabutanDailyCollector:
             return False
 
     def get_target_months(self):
-        """対象月を取得（当月と前月） ★変更なし"""
+        """対象月を取得（★一時的に5年分に変更。終わったら元に戻す）"""
         today = datetime.now()
-        current_year = today.year
-        current_month = today.month
-
         months = []
-
-        # 前月
-        if current_month == 1:
-            prev_year = current_year - 1
-            prev_month = 12
-        else:
-            prev_year = current_year
-            prev_month = current_month - 1
-
-        months.append((prev_year, prev_month))
-
-        # 当月
-        months.append((current_year, current_month))
-
+        for y in range(today.year - 5, today.year + 1):
+            for m in range(1, 13):
+                if (y, m) <= (today.year, today.month):
+                    months.append((y, m))
         return months
 
     def run_daily_collection(self):
