@@ -207,7 +207,7 @@ class StockBasedDataOrganizer:
                             continue
 
                         stock_code = disclosure.get('stock_code')
-                        if stock_code and re.match(r'^\d{4}$', str(stock_code).strip()):
+                        if stock_code and re.match(r'^[\dA-Za-z]{4}$', str(stock_code).strip()):
                             stock_code = str(stock_code).strip()
 
                             # 🔧 修正2: ゴミレコード除外
