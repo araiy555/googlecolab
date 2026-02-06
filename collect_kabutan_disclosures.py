@@ -48,8 +48,8 @@ class KabutanDailyCollector:
         self.s3_prefix = "japan-stocks-5years-chart/monthly-disclosures/"
 
         # リクエスト設定
-        self.delay_base = 1.0
-        self.delay_variance = 0.3
+        self.delay_base = 0.7
+        self.delay_variance = 0.2
         self.retry_delay = 5.0
         self.max_retries = 5
         self.session_reset_interval = 200
@@ -313,8 +313,20 @@ class KabutanDailyCollector:
         return unique
 
     # ─────────────────────────────────────────────
-    # S3保存
+    # S3保存 / 既存チェック
     # ─────────────────────────────────────────────
+
+    def check_existing_month(self, year, month):
+        """S3に既存データがあるか確認。件数を返す（なければ0）"""
+        if not self.s3:
+            return 0
+        try:
+            key = f"{self.s3_prefix}{year}-{month:02d}.json"
+            resp = self.s3.get_object(Bucket=self.bucket_name, Key=key)
+            data = json.loads(resp['Body'].read().decode('utf-8'))
+            return data.get('total_disclosures', 0)
+        except Exception:
+            return 0
 
     def save_to_s3(self, year, month, disclosures):
         if not self.s3:
@@ -387,11 +399,24 @@ class KabutanDailyCollector:
 
         ok = 0
         ng = 0
+        skipped = 0
         total_records = 0
+        today = datetime.now()
 
         for idx, (year, month) in enumerate(months, 1):
             elapsed = time.time() - self.stats['start_time']
             print(f"[{idx}/{total}] {year}/{month:02d} ", end='', flush=True)
+
+            # 当月以外で既にS3にデータがある月はスキップ
+            is_current_month = (year == today.year and month == today.month)
+            if not is_current_month:
+                existing_count = self.check_existing_month(year, month)
+                if existing_count >= 100:  # 100件以上あれば取得済みとみなす
+                    print(f"スキップ(既存{existing_count}件)", flush=True)
+                    skipped += 1
+                    total_records += existing_count
+                    ok += 1
+                    continue
 
             try:
                 records = self.fetch_month(year, month)
@@ -408,7 +433,7 @@ class KabutanDailyCollector:
         elapsed = time.time() - self.stats['start_time']
         print("\n" + "=" * 60)
         print("収集完了")
-        print(f"成功: {ok}ヶ月 / 失敗: {ng}ヶ月")
+        print(f"成功: {ok}ヶ月 / 失敗: {ng}ヶ月 / スキップ: {skipped}ヶ月")
         print(f"総開示件数: {total_records:,}件")
         print(f"HTTP: {self.stats['requests']}回 (成功{self.stats['success']}回)")
         print(f"処理時間: {elapsed/60:.1f}分")
