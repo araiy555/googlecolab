@@ -36,7 +36,9 @@ class StockBasedDataOrganizer:
                 aws_access_key_id=aws_access_key,
                 aws_secret_access_key=aws_secret_key,
                 region_name="ap-northeast-1"
-        )
+            )
+        else:
+            self.s3 = boto3.client('s3', region_name="ap-northeast-1")
         self.bucket_name = "m-s3storage"
 
         # データ取得パス（正確なパス）
@@ -199,6 +201,7 @@ class StockBasedDataOrganizer:
 
                     # 銘柄別に分類
                     processed_count = 0
+                    filtered_count = 0
                     for disclosure in disclosures:
                         if not isinstance(disclosure, dict):
                             continue
@@ -206,12 +209,27 @@ class StockBasedDataOrganizer:
                         stock_code = disclosure.get('stock_code')
                         if stock_code and re.match(r'^\d{4}$', str(stock_code).strip()):
                             stock_code = str(stock_code).strip()
+
+                            # 🔧 修正2: ゴミレコード除外
+                            title = disclosure.get('title', '')
+                            cn = disclosure.get('company_name', '')
+                            if any(kw in title for kw in ['次へ', '前へ', '＞»', '«＜']):
+                                filtered_count += 1
+                                continue
+                            if any(kw in cn for kw in ['次へ', '前へ', '＞»', '«＜']):
+                                filtered_count += 1
+                                continue
+                            if cn == '抽出中' and (len(title) > 100 or '\n' in title):
+                                filtered_count += 1
+                                continue
+
                             enhanced_disclosure = self.enhance_disclosure_data(disclosure)
                             stock_data[stock_code].append(enhanced_disclosure)
                             processed_count += 1
                             self.stats['total_disclosures'] += 1
 
-                    self.logger.info(f"  ✓ 処理完了: {processed_count:,}件")
+                    skip_info = f" (除外: {filtered_count}件)" if filtered_count > 0 else ""
+                    self.logger.info(f"  ✓ 処理完了: {processed_count:,}件{skip_info}")
                     self.stats['processed_months'] += 1
 
                 except Exception as e:
@@ -844,4 +862,3 @@ def get_sample(stock_code="1301"):
 
 if __name__ == "__main__":
     main()
-    
