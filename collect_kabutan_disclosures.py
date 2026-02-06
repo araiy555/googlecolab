@@ -411,7 +411,7 @@ class KabutanDailyCollector:
             is_current_month = (year == today.year and month == today.month)
             if not is_current_month:
                 existing_count = self.check_existing_month(year, month)
-                if existing_count >= 100:  # 100件以上あれば取得済みとみなす
+                if existing_count > 0:
                     print(f"スキップ(既存{existing_count}件)", flush=True)
                     skipped += 1
                     total_records += existing_count
