@@ -3,10 +3,13 @@
 株探開示情報日次収集システム
 毎日当月と前月のデータを取得・更新（データ漏れ防止）
 
-修正箇所（3箇所のみ）:
-  1. parse_disclosure_row: 市場名スキップリスト追加（短い会社名を拾いつつ市場名を除外）
-  2. parse_disclosure_row: 日付パースを YY/MM/DD 3グループに修正（日の精度喪失を修正）
-  3. parse_disclosure_item: ゴミHTML（ページネーション等）を除外するフィルタ追加
+修正内容:
+  - extract_disclosures_from_page: 全テーブルのヒューリスティック解析を廃止
+    → table.stock_table の固定6カラム（コード/会社名/市場/情報種別/タイトル/日時）で直接抽出
+  - <time datetime="YYYY-MM-DDT..."> から正確な日付を取得
+  - 銘柄コード 149A 等の英字含むコードにも対応
+  - 重複除去（stock_code+date+title）
+  - get_target_months: ★一時的に5年分。終わったら元に戻す
 """
 
 import requests
@@ -206,134 +209,91 @@ class KabutanDailyCollector:
             return []
 
     def extract_disclosures_from_page(self, soup, year, month):
-        """ページから開示情報を抽出 ★変更なし"""
+        """ページから開示情報を抽出（stock_tableの固定カラム位置で抽出）
+        
+        kabutan.jp の開示テーブル構造:
+          <table class="stock_table">
+            <thead><tr>
+              <th>コード</th><th>会社名</th><th>市場</th>
+              <th>情報種別</th><th>タイトル</th><th>開示日時</th>
+            </tr></thead>
+            <tbody><tr>
+              <td>[0] コード</td>
+              <th>[1] 会社名</th>
+              <td>[2] 市場</td>
+              <td>[3] 情報種別</td>
+              <td>[4] タイトル（<a>内）</td>
+              <td>[5] 日時（<time datetime="YYYY-MM-DDT...">）</td>
+            </tr></tbody>
+        """
         disclosures = []
 
-        tables = soup.find_all('table')
-        for table in tables:
-            rows = table.find_all('tr')
-            for row in rows:
-                cells = row.find_all(['td', 'th'])
-                if len(cells) >= 3:
-                    row_data = self.parse_disclosure_row(cells, year, month)
-                    if row_data:
-                        disclosures.append(row_data)
+        table = soup.find('table', class_='stock_table')
+        if not table:
+            return disclosures
 
-        disclosure_items = soup.find_all(['div', 'li'], class_=re.compile(r'disclosure|item|news'))
-        for item in disclosure_items:
-            item_data = self.parse_disclosure_item(item, year, month)
-            if item_data:
-                disclosures.append(item_data)
+        tbody = table.find('tbody')
+        if not tbody:
+            return disclosures
+
+        for row in tbody.find_all('tr'):
+            cells = row.find_all(['td', 'th'])
+            if len(cells) < 6:
+                continue
+
+            try:
+                # [0] 銘柄コード（<a>タグ内、149Aなど英字含むコードにも対応）
+                code_link = cells[0].find('a')
+                stock_code = code_link.get_text().strip() if code_link else cells[0].get_text().strip()
+                if not stock_code:
+                    continue
+
+                # [1] 会社名
+                company_name = cells[1].get_text().strip() or "不明"
+
+                # [2] 市場
+                market = cells[2].get_text().strip()
+
+                # [3] 情報種別（HTMLから直接取得）
+                info_type = cells[3].get_text().strip()
+
+                # [4] タイトル（<a>タグ内のテキスト）
+                title_link = cells[4].find('a')
+                title = title_link.get_text().strip() if title_link else cells[4].get_text().strip()
+                title = title or "不明"
+
+                # [5] 開示日時（<time datetime="2026-02-06T18:05:00+09:00">）
+                time_tag = cells[5].find('time')
+                if time_tag and time_tag.get('datetime'):
+                    date_info = time_tag['datetime'][:10]  # "2026-02-06"
+                else:
+                    date_text = cells[5].get_text().strip()
+                    date_match = re.search(r'(\d{2})/(\d{2})/(\d{2})', date_text)
+                    if date_match:
+                        yy = int(date_match.group(1))
+                        mm = int(date_match.group(2))
+                        dd = int(date_match.group(3))
+                        date_info = f"{2000+yy}-{mm:02d}-{dd:02d}"
+                    else:
+                        date_info = f"{year}-{month:02d}-01"
+
+                disclosures.append({
+                    'stock_code': stock_code,
+                    'company_name': company_name,
+                    'title': title,
+                    'date': date_info,
+                    'market': market,
+                    'info_type': info_type,
+                    'category': self.categorize_disclosure(title),
+                    'source': '株探',
+                    'year': year,
+                    'month': month
+                })
+
+            except Exception:
+                continue
 
         return disclosures
-
-    def parse_disclosure_row(self, cells, year, month):
-        """テーブル行から開示情報をパース
-        
-        🔧 修正1: 市場名スキップリスト追加（短い会社名を拾いつつ市場名を除外）
-        🔧 修正2: 日付パースを YY/MM/DD 3グループに変更
-        """
-        try:
-            texts = [cell.get_text().strip() for cell in cells]
-
-            stock_code = None
-            date_info = None
-            title = None
-            company_name = None
-
-            for i, text in enumerate(texts):
-                if not stock_code:
-                    codes = re.findall(r'\b(\d{4})\b', text)
-                    for code in codes:
-                        if 1000 <= int(code) <= 9999:
-                            stock_code = code
-                            break
-
-                # 🔧 修正2: 日付パース
-                # 旧: r'(\d{1,2})/(\d{1,2})' → "20/04/13" から ('20','04') のみ → 日=月番号に
-                # 新: YY/MM/DD を3グループで取得し、日まで正確に取る
-                if not date_info:
-                    date_match_3 = re.search(r'(\d{2})/(\d{2})/(\d{2})(?:\s+\d{1,2}:\d{2})?', text)
-                    if date_match_3:
-                        yy = int(date_match_3.group(1))
-                        mm = int(date_match_3.group(2))
-                        dd = int(date_match_3.group(3))
-                        full_year = 2000 + yy
-                        if 1 <= mm <= 12 and 1 <= dd <= 31:
-                            date_info = f"{full_year}-{mm:02d}-{dd:02d}"
-                    else:
-                        # フォールバック: 元のMM/DDパターン
-                        date_matches = re.findall(r'(\d{1,2})/(\d{1,2})', text)
-                        if date_matches:
-                            month_day = date_matches[0]
-                            date_info = f"{year}-{month:02d}-{int(month_day[1]):02d}"
-
-                # 🔧 修正1: company_name と title で条件を分ける
-                # 旧: 両方 len > 5 → 「オンリー」(4文字) がスキップされフィールド入替
-                # 新: company_name は len > 1（短い名前OK）+ 市場名除外
-                #     title は len > 5（情報種別「決算」等の短いテキストを除外）
-                MARKET_NAMES = {'東証Ｐ', '東証Ｓ', '東証Ｇ', '東証', '名証',
-                                '名証Ｍ', '名証Ｎ', '福証', '福証Ｑ', '札証',
-                                '札証Ａ', 'JQ', 'マザーズ', 'グロース', 'スタンダード',
-                                'プライム', 'JASDAQ'}
-                if not re.match(r'^\d+$', text):
-                    if not company_name and stock_code and len(text) > 1 and text not in MARKET_NAMES:
-                        company_name = text
-                    elif not title and len(text) > 5:
-                        title = text
-
-            if stock_code:
-                return {
-                    'stock_code': stock_code,
-                    'company_name': company_name or "不明",
-                    'title': title or "不明",
-                    'date': date_info or f"{year}-{month:02d}-01",
-                    'category': self.categorize_disclosure(title or ""),
-                    'source': '株探',
-                    'year': year,
-                    'month': month
-                }
-
-        except Exception:
-            pass
-
-        return None
-
-    def parse_disclosure_item(self, item, year, month):
-        """アイテムから開示情報をパース
-        
-        🔧 修正3: ページネーションHTML等のゴミを除外
-        """
-        try:
-            text = item.get_text().strip()
-
-            # 🔧 修正3: ゴミ除外フィルタ
-            if any(kw in text for kw in ['次へ', '前へ', '＞»', '«＜']):
-                return None
-
-            codes = re.findall(r'\b(\d{4})\b', text)
-            stock_code = None
-            for code in codes:
-                if 1000 <= int(code) <= 9999:
-                    stock_code = code
-                    break
-
-            if stock_code and len(text) > 10:
-                return {
-                    'stock_code': stock_code,
-                    'company_name': "抽出中",
-                    'title': text[:200],
-                    'date': f"{year}-{month:02d}-01",
-                    'category': self.categorize_disclosure(text),
-                    'source': '株探',
-                    'year': year,
-                    'month': month
-                }
-
-        except Exception:
-            pass
-
-        return None
 
     def categorize_disclosure(self, title):
         """開示情報のカテゴリ分類 ★変更なし"""
@@ -410,14 +370,14 @@ class KabutanDailyCollector:
 
         # 対象月を取得
         target_months = self.get_target_months()
-        print(f"対象月: {target_months[0][0]}年{target_months[0][1]}月 と {target_months[1][0]}年{target_months[1][1]}月")
+        print(f"対象月: {len(target_months)}ヶ月分 ({target_months[0][0]}年{target_months[0][1]}月 〜 {target_months[-1][0]}年{target_months[-1][1]}月)")
         print("=" * 60)
 
         total_new = 0
 
         try:
-            for year, month in target_months:
-                print(f"\n処理: {year}年{month}月")
+            for idx, (year, month) in enumerate(target_months, 1):
+                print(f"\n[{idx}/{len(target_months)}] 処理: {year}年{month}月")
 
                 # 既存データを取得
                 existing_data = self.load_existing_month_data(year, month)
@@ -447,7 +407,9 @@ class KabutanDailyCollector:
             return True
 
         except Exception as e:
+            import traceback
             print(f"エラー: {e}")
+            traceback.print_exc()
             return False
 
 
@@ -478,7 +440,8 @@ def notify_slack(status, message):
 
 
 def main():
-    """メイン実行関数 ★変更なし"""
+    """メイン実行関数"""
+    import traceback
     try:
         collector = KabutanDailyCollector()
         collector.run_daily_collection()
@@ -486,6 +449,7 @@ def main():
         notify_slack("success", "日次データ収集が正常に完了しました")
     except Exception as e:
         print(f"エラーが発生しました: {e}")
+        traceback.print_exc()
         notify_slack("failure", f"エラーが発生しました: {str(e)}")
 
 if __name__ == "__main__":
