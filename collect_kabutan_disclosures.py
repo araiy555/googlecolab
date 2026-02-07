@@ -364,23 +364,15 @@ class KabutanDailyCollector:
     # ─────────────────────────────────────────────
 
     def get_target_months(self):
-        """★一時的に5年分。終わったら下のコメントアウト版に戻す"""
+        """当月と前月の2ヶ月分を取得"""
         today = datetime.now()
         months = []
-        for y in range(today.year - 5, today.year + 1):
-            for m in range(1, 13):
-                if (y, m) <= (today.year, today.month):
-                    months.append((y, m))
+        if today.month == 1:
+            months.append((today.year - 1, 12))
+        else:
+            months.append((today.year, today.month - 1))
+        months.append((today.year, today.month))
         return months
-        # ---- 通常版（5年取得が終わったらこちらに戻す）----
-        # today = datetime.now()
-        # months = []
-        # if today.month == 1:
-        #     months.append((today.year - 1, 12))
-        # else:
-        #     months.append((today.year, today.month - 1))
-        # months.append((today.year, today.month))
-        # return months
 
     # ─────────────────────────────────────────────
     # メインループ
@@ -399,24 +391,11 @@ class KabutanDailyCollector:
 
         ok = 0
         ng = 0
-        skipped = 0
         total_records = 0
-        today = datetime.now()
 
         for idx, (year, month) in enumerate(months, 1):
             elapsed = time.time() - self.stats['start_time']
             print(f"[{idx}/{total}] {year}/{month:02d} ", end='', flush=True)
-
-            # 当月以外で既にS3にデータがある月はスキップ
-            is_current_month = (year == today.year and month == today.month)
-            if not is_current_month:
-                existing_count = self.check_existing_month(year, month)
-                if existing_count > 0:
-                    print(f"スキップ(既存{existing_count}件)", flush=True)
-                    skipped += 1
-                    total_records += existing_count
-                    ok += 1
-                    continue
 
             try:
                 records = self.fetch_month(year, month)
@@ -433,7 +412,7 @@ class KabutanDailyCollector:
         elapsed = time.time() - self.stats['start_time']
         print("\n" + "=" * 60)
         print("収集完了")
-        print(f"成功: {ok}ヶ月 / 失敗: {ng}ヶ月 / スキップ: {skipped}ヶ月")
+        print(f"成功: {ok}ヶ月 / 失敗: {ng}ヶ月")
         print(f"総開示件数: {total_records:,}件")
         print(f"HTTP: {self.stats['requests']}回 (成功{self.stats['success']}回)")
         print(f"処理時間: {elapsed/60:.1f}分")
