@@ -47,7 +47,7 @@ class MarketIndicatorsCollector:
         # Yahoo Financeティッカー
         self.tickers = {
             "日経平均": "^N225",
-            "TOPIX": "^TOPX",                    # ★追加
+            "TOPIX": "^TPX",                    # ★追加
             "日経225先物": "NIY=F",
             "VIX": "^VIX",
             "米国10年国債利回り": "^TNX",
