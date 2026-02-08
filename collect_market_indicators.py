@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 市場指標データ収集システム＋株価変動理由づけ
-日経平均、日経225先物、VIX、金利(日米)、商品市場、為替、米国株指数、ビットコインを取得し、
-S3に保存
+日経平均、日経225先物、VIX、金利、商品市場、為替、米国株指数、ビットコインを取得し、
+S3に保存、株価変動理由を自動分析
 """
 
 import boto3
@@ -12,9 +12,9 @@ from datetime import datetime, timedelta
 import yfinance as yf
 import requests
 
-
 class MarketIndicatorsCollector:
     def __init__(self):
+        """市場指標収集システム初期化"""
         print("市場指標収集システム初期化中...")
 
         self.bucket_name = "m-s3storage"
@@ -26,18 +26,19 @@ class MarketIndicatorsCollector:
             "日経225先物": "NIY=F",
             "VIX": "^VIX",
             "米国10年国債利回り": "^TNX",
-            "日本10年国債利回り": "^GBJP10Y",   # ★追加
             "WTI原油": "CL=F",
             "金価格": "GC=F",
             "USDJPY": "JPY=X",
             "S&P500": "^GSPC",
-            "BTC-USD": "BTC-USD",
+            "BTC-USD": "BTC-USD"  # ビットコイン追加
         }
 
+        # S3クライアント
         self.s3 = self._init_s3_client()
         print("初期化完了")
 
     def _init_s3_client(self):
+        """S3クライアント初期化"""
         try:
             os.environ['AWS_ACCESS_KEY_ID'] = os.getenv('AWS_ACCESS_KEY_ID')
             os.environ['AWS_SECRET_ACCESS_KEY'] = os.getenv('AWS_SECRET_ACCESS_KEY')
@@ -47,11 +48,13 @@ class MarketIndicatorsCollector:
             return None
 
     def _get_date_range(self, years=5):
+        """開始日と終了日を返す"""
         end = datetime.today()
-        start = end - timedelta(days=365 * years)
+        start = end - timedelta(days=365*years)
         return start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d')
 
     def _fetch_data(self, ticker_symbol, years=5):
+        """Yahoo Finance からデータ取得"""
         start, end = self._get_date_range(years)
         ticker = yf.Ticker(ticker_symbol)
         hist = ticker.history(start=start, end=end, interval="1d")
@@ -68,6 +71,7 @@ class MarketIndicatorsCollector:
         return data
 
     def fetch_indicator(self, name, ticker, years=5):
+        """汎用インジケータ取得"""
         print(f"{name} データ取得中（過去{years}年）...")
         try:
             data = self._fetch_data(ticker, years)
@@ -81,6 +85,7 @@ class MarketIndicatorsCollector:
             return []
 
     def _classify_fear_level(self, vix_value):
+        """VIXから恐怖レベル分類"""
         if vix_value < 12:
             return "極低ボラティリティ"
         elif vix_value < 20:
@@ -93,6 +98,7 @@ class MarketIndicatorsCollector:
             return "極高ボラティリティ"
 
     def calculate_basis(self, nikkei_data, futures_data):
+        """日経平均と先物のベーシス計算"""
         print("ベーシス（先物プレミアム）計算中...")
         basis_data = []
         nikkei_dict = {d['date']: d['close'] for d in nikkei_data}
@@ -114,7 +120,9 @@ class MarketIndicatorsCollector:
         return basis_data
 
     def analyze_stock_movement(self, latest_nikkei, indicators_latest):
+        """株価変動理由づけ分析（簡易）"""
         reason = []
+        # 前日比
         prev_close = latest_nikkei['close']
         today_close = latest_nikkei['close']
         diff = today_close - prev_close
@@ -127,6 +135,7 @@ class MarketIndicatorsCollector:
         else:
             reason.append("日経平均は前日比横ばい")
 
+        # 為替影響
         usd_jpy = indicators_latest.get("USDJPY", {}).get('close', None)
         if usd_jpy:
             if usd_jpy > 150:
@@ -134,14 +143,17 @@ class MarketIndicatorsCollector:
             else:
                 reason.append("ドル円安 → 輸出企業にとって株価上押し要因")
 
+        # 米国株影響
         sp500 = indicators_latest.get("S&P500", {}).get('close', None)
         if sp500:
             reason.append("米国株(S&P500)動向も市場心理に影響")
 
+        # VIX影響
         vix = indicators_latest.get("VIX", {}).get('fear_level', None)
         if vix:
             reason.append(f"VIX: {vix} → 投資家心理を反映")
 
+        # 商品・金利影響
         oil = indicators_latest.get("WTI原油", {}).get('close', None)
         gold = indicators_latest.get("金価格", {}).get('close', None)
         us10y = indicators_latest.get("米国10年国債利回り", {}).get('close', None)
@@ -153,17 +165,15 @@ class MarketIndicatorsCollector:
         if us10y and us10y > 4:
             reason.append("米国金利高 → 株式売り圧力")
 
+        # ビットコイン影響
         btc = indicators_latest.get("BTC-USD", {}).get('close', None)
         if btc and btc > 50000:
             reason.append("ビットコイン高 → 暗号資産関連企業株価押し上げ要因")
 
-        jgb = indicators_latest.get("日本10年国債利回り", {})
-        if jgb.get('close'):
-            reason.append(f"日本10年債利回り: {jgb['close']}%")
-
         return reason
 
     def save_to_s3(self, filename, data):
+        """S3保存"""
         if not self.s3:
             print("S3クライアントが利用できません")
             return False
@@ -182,67 +192,64 @@ class MarketIndicatorsCollector:
             return False
 
     def run_collection(self, years=5):
-        print("=" * 60)
+        """データ収集実行"""
+        print("="*60)
         print(f"市場指標データ収集開始（過去{years}年）")
-        print("=" * 60)
+        print("="*60)
 
         results = {}
-
-        # Yahoo Finance データ（全ティッカー一括）
         for name, ticker in self.tickers.items():
             results[name] = self.fetch_indicator(name, ticker, years)
 
         # ベーシス計算
         if results.get("日経平均") and results.get("日経225先物"):
-            results["ベーシス"] = self.calculate_basis(
-                results["日経平均"], results["日経225先物"]
-            )
+            results["ベーシス"] = self.calculate_basis(results["日経平均"], results["日経225先物"])
 
         today = datetime.now().strftime('%Y-%m-%d')
         complete_data = {
             'collection_date': today,
             'years': years,
             'data': results,
-            'latest_values': {},
+            'latest_values': {}
         }
 
         # 最新値追加
         for name, data in results.items():
             if data:
-                complete_data['latest_values'][name] = data[-1]
+                latest = data[-1]
+                complete_data['latest_values'][name] = latest
 
-        # 株価変動理由づけ
+        # 株価変動理由づけ分析
         if "日経平均" in complete_data['latest_values']:
-            reasons = self.analyze_stock_movement(
-                complete_data['latest_values']["日経平均"],
-                complete_data['latest_values']
-            )
+            latest_nikkei = complete_data['latest_values']["日経平均"]
+            reasons = self.analyze_stock_movement(latest_nikkei, complete_data['latest_values'])
             complete_data['stock_movement_reasons'] = reasons
 
         # S3保存
         self.save_to_s3(f"complete-market-data-{today}.json", complete_data)
 
         print("\n収集完了サマリー")
-        print("=" * 60)
+        print("="*60)
         for name, data in results.items():
             print(f"{name}: {len(data)}日分")
         if "stock_movement_reasons" in complete_data:
             print("\n株価変動理由:")
             for r in complete_data['stock_movement_reasons']:
-                print(f"  - {r}")
-        print("=" * 60)
+                print(f" - {r}")
+        print("="*60)
         return complete_data
 
-
 def notify_slack(status, message):
+    """Slackに通知を送る"""
     slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    print(f"Webhook URL: {slack_webhook_url}")  # デバッグ用
     if not slack_webhook_url:
         print("警告: SLACK_WEBHOOK_URLが設定されていません")
         return
-
+    
     color = "good" if status == "success" else "danger"
     emoji = "✅" if status == "success" else "❌"
-
+    
     payload = {
         "attachments": [{
             "color": color,
@@ -251,7 +258,7 @@ def notify_slack(status, message):
             "footer": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }]
     }
-
+    
     try:
         requests.post(slack_webhook_url, json=payload)
     except Exception as e:
@@ -259,19 +266,19 @@ def notify_slack(status, message):
 
 
 def main():
+    """メイン実行"""
     try:
         collector = MarketIndicatorsCollector()
         result = collector.run_collection(years=5)
-
+        
         s3_path = f"s3://{collector.bucket_name}/{collector.s3_prefix}"
-        print(f"\n処理完了")
+        print("\n処理完了")
         print(f"データ保存先: {s3_path}")
-
+        
         notify_slack("success", f"市場指標データ収集が完了しました\nデータ保存先: {s3_path}")
     except Exception as e:
         print(f"エラーが発生しました: {e}")
         notify_slack("failure", f"エラーが発生しました: {str(e)}")
-
 
 if __name__ == "__main__":
     main()
