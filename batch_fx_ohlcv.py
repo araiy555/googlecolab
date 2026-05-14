@@ -89,17 +89,7 @@ class FxOhlcvCollector:
         """
         for attempt in range(1, MAX_RETRY + 1):
             try:
-                # User-Agentを設定してレートリミットを回避
-                session = requests.Session()
-                session.headers.update({
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    )
-                })
-
-                ticker = yf.Ticker(ticker_symbol, session=session)
+                ticker = yf.Ticker(ticker_symbol)
                 df = ticker.history(period=period, interval=interval)
 
                 if df.empty:
