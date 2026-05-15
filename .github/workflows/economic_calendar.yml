@@ -1,9 +1,9 @@
-name: 経済指標カレンダー取得
+name: FRED経済指標取得
 
 on:
   schedule:
-    - cron: '30 21 * * 1-5'  # 毎週月〜金 JST 06:30（UTC 21:30）
-  workflow_dispatch:           # 手動実行も可能
+    - cron: '0 22 * * 1-5'  # 毎週月〜金 JST 07:00（UTC 22:00）
+  workflow_dispatch:          # 手動実行も可能
 
 jobs:
   collect:
@@ -20,12 +20,13 @@ jobs:
 
       - name: 依存ライブラリインストール
         run: |
-          pip install boto3 requests beautifulsoup4
+          pip install boto3 requests
 
-      - name: 経済指標カレンダー取得
+      - name: FRED経済指標取得
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           SLACK_WEBHOOK_URL:     ${{ secrets.SLACK_WEBHOOK_URL }}
+          FRED_API_KEY:          ${{ secrets.FRED_API_KEY }}
         run: |
-          python batch_economic_calendar.py
+          python batch_fred_indicators.py
