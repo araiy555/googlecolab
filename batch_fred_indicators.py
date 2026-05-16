@@ -1,72 +1,53 @@
 #!/usr/bin/env python3
 """
-FRED経済指標データ収集システム（GitHub Actions用）
-FRED APIから主要経済指標を取得しS3に保存する
+Finnhub経済指標カレンダー収集システム（GitHub Actions用）
+Finnhub APIから経済指標カレンダー（発表日時・予想・結果・前回値）を取得しS3に保存する
 
 参考: market_indicators_collector.py と同じ構造・スタイルで実装
 
 S3保存先:
-  m-s3storage/fred-indicators/YYYY-MM/fred-YYYY-MM-DD.json  # 日別アーカイブ
-  m-s3storage/fred-indicators/latest.json                    # 常に最新を上書き
+  m-s3storage/finnhub-calendar/YYYY-MM/calendar-YYYY-MM-DD.json  # 日別アーカイブ
+  m-s3storage/finnhub-calendar/latest.json                        # 常に最新を上書き
+  m-s3storage/finnhub-calendar/historical/all-events.json         # 全期間データ（初回のみ）
 
-取得指標:
-  米国: FFレート, 10年債, 2年債, CPI, コアCPI, PPI,
-        非農業部門雇用者数, 失業率, 平均時給, GDP成長率,
-        小売売上高, 消費者信頼感
-  日本: 政策金利, 10年債, CPI, GDP成長率
-  為替: ドル円, ユーロドル
-  リスク: VIX
+取得データのイメージ（1件）:
+  {
+    "date":     "2024-11-01",
+    "time":     "2024-11-01T12:30:00",
+    "country":  "US",
+    "event":    "Non-Farm Payrolls",
+    "impact":   "high",
+    "previous": 254000,
+    "estimate": 220000,
+    "actual":   12000
+  }
 """
 
 import boto3
 import json
 import os
+import time
 from datetime import datetime, timezone, timedelta
 import requests
 
-# FRED API ベースURL
-FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
+# Finnhub API
+FINNHUB_URL = "https://finnhub.io/api/v1/calendar/economic"
+FINNHUB_KEY = "d83utn1r01qkm5c9l6s0d83utn1r01qkm5c9l6sg"
+
+# 対象国（ドル円・日本株に影響する主要国）
+TARGET_COUNTRIES = {"US", "JP", "EU", "GB", "CN", "AU", "CA"}
+
+# レートリミット対策（無料プランは60回/分）
+SLEEP_BETWEEN_REQUESTS = 2
 
 
-class FredIndicatorsCollector:
+class FinnhubCalendarCollector:
     def __init__(self):
-        """FRED経済指標収集システム初期化"""
-        print("FRED経済指標収集システム初期化中...")
+        """Finnhub経済指標カレンダー収集システム初期化"""
+        print("Finnhub経済指標カレンダー収集システム初期化中...")
 
         self.bucket_name = "m-s3storage"
-        self.s3_prefix = "fred-indicators/"
-        self.api_key = os.getenv("FRED_API_KEY", "91935bcccf126bf926f4a17787036841")
-
-
-        # 取得対象指標: {指標名: FRED系列ID}
-        self.indicators = {
-            # 米国金利
-            "米国FFレート":       "FEDFUNDS",
-            "米国10年債利回り":   "GS10",
-            "米国2年債利回り":    "GS2",
-            # 米国インフレ
-            "米国CPI":            "CPIAUCSL",
-            "米国コアCPI":        "CPILFESL",
-            "米国PPI":            "PPIACO",
-            # 米国雇用
-            "米国非農業部門雇用者数": "PAYEMS",
-            "米国失業率":         "UNRATE",
-            "米国平均時給":       "CES0500000003",
-            # 米国景気
-            "米国GDP成長率":      "A191RL1Q225SBEA",
-            "米国小売売上高":     "RSAFS",
-            "米国消費者信頼感":   "UMCSENT",
-            # 日本
-            "日本政策金利":       "IRSTCB01JPM156N",
-            "日本10年債利回り":   "IRLTLT01JPM156N",
-            "日本CPI":            "JPNCPIALLMINMEI",
-            "日本GDP成長率":      "JPNRGDPEXP",
-            # 為替
-            "ドル円":             "DEXJPUS",
-            "ユーロドル":         "DEXUSEU",
-            # リスク
-            "VIX":                "VIXCLS",
-        }
+        self.s3_prefix   = "finnhub-calendar/"
 
         # 取得期間（過去5年分）
         self.start_date = (datetime.now() - timedelta(days=365 * 5)).strftime('%Y-%m-%d')
@@ -85,44 +66,48 @@ class FredIndicatorsCollector:
             print(f"S3初期化失敗: {e}")
             return None
 
-    def fetch_series(self, name, series_id):
-        """FRED APIから1系列のデータを取得する"""
-        print(f"  {name} ({series_id}) 取得中...")
+    def fetch_calendar(self, from_date, to_date):
+        """Finnhub APIから指定期間の経済指標カレンダーを取得する"""
+        print(f"  {from_date} ～ {to_date} 取得中...")
         try:
             params = {
-                "series_id":        series_id,
-                "api_key":          self.api_key,
-                "file_type":        "json",
-                "observation_start": self.start_date,
-                "observation_end":   self.end_date,
-                "sort_order":       "asc",
+                "from":  from_date,
+                "to":    to_date,
+                "token": FINNHUB_KEY,
             }
-            res = requests.get(FRED_BASE_URL, params=params, timeout=30)
+            res = requests.get(FINNHUB_URL, params=params, timeout=30)
             res.raise_for_status()
 
-            data = res.json()
-            observations = data.get("observations", [])
+            events = res.json().get("economicCalendar", [])
 
-            # 欠損値（"."）を除外してリスト化
+            # 対象国フィルタ・正規化
             records = []
-            for obs in observations:
-                if obs["value"] != ".":
-                    records.append({
-                        "date":  obs["date"],
-                        "value": float(obs["value"]),
-                    })
+            for e in events:
+                if e.get("country", "") not in TARGET_COUNTRIES:
+                    continue
+                records.append({
+                    "date":     e.get("date", "")[:10],
+                    "time":     e.get("time", ""),
+                    "country":  e.get("country", ""),
+                    "event":    e.get("event", ""),
+                    "impact":   e.get("impact", ""),
+                    "previous": e.get("prev"),
+                    "estimate": e.get("estimate"),
+                    "actual":   e.get("actual"),
+                    "unit":     e.get("unit", ""),
+                })
 
-            print(f"  ✓ {name}: {len(records)}件取得")
+            print(f"  ✓ {from_date} ～ {to_date}: {len(records)}件取得")
             return records
 
         except requests.exceptions.HTTPError as e:
-            print(f"  ✗ {name} HTTPエラー: {e}")
+            print(f"  ✗ HTTPエラー: {e}")
             return []
         except requests.exceptions.Timeout:
-            print(f"  ✗ {name} タイムアウト")
+            print(f"  ✗ タイムアウト: {from_date} ～ {to_date}")
             return []
         except Exception as e:
-            print(f"  ✗ {name} 取得失敗: {e}")
+            print(f"  ✗ 取得失敗: {e}")
             return []
 
     def save_to_s3(self, filename, data):
@@ -144,58 +129,84 @@ class FredIndicatorsCollector:
             print(f"✗ S3保存エラー: {e}")
             return False
 
-    def run_collection(self):
-        """データ収集実行"""
+    def run_collection(self, mode="daily"):
+        """
+        データ収集実行
+        mode: "historical" → 過去5年分一括取得（初回のみ）
+              "daily"      → 直近7日分取得（毎日のcron用）
+        """
         print("=" * 60)
-        print(f"FRED経済指標収集開始（{self.start_date} ～ {self.end_date}）")
+        print(f"Finnhub経済指標カレンダー収集開始（mode={mode}）")
         print("=" * 60)
 
         today_str = datetime.now().strftime('%Y-%m-%d')
         ym        = today_str[:7]
 
-        results      = {}
-        success_count = 0
-        fail_count    = 0
+        all_events = []
 
-        for name, series_id in self.indicators.items():
-            records = self.fetch_series(name, series_id)
-            if records:
-                results[name] = records
-                success_count += 1
-            else:
-                results[name] = []
-                fail_count += 1
+        if mode == "historical":
+            # 月単位で分割して過去5年分を取得
+            current    = datetime.strptime(self.start_date, '%Y-%m-%d')
+            end        = datetime.strptime(self.end_date,   '%Y-%m-%d')
 
-        # 各指標の最新値をまとめる
-        latest_values = {}
-        for name, records in results.items():
-            if records:
-                latest_values[name] = records[-1]
+            while current < end:
+                from_date = current.strftime('%Y-%m-%d')
+
+                if current.month == 12:
+                    next_month = current.replace(year=current.year + 1, month=1, day=1)
+                else:
+                    next_month = current.replace(month=current.month + 1, day=1)
+
+                to_date = min(next_month - timedelta(days=1), end).strftime('%Y-%m-%d')
+
+                records = self.fetch_calendar(from_date, to_date)
+                all_events.extend(records)
+
+                current = next_month
+                time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+        else:
+            # 直近7日分のみ取得
+            from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            all_events = self.fetch_calendar(from_date, today_str)
+
+        if not all_events:
+            print("✗ イベントが0件のため保存をスキップします")
+            return []
+
+        # 重要度別件数
+        high_count   = sum(1 for e in all_events if e["impact"] == "high")
+        medium_count = sum(1 for e in all_events if e["impact"] == "medium")
+        result_count = sum(1 for e in all_events if e["actual"] is not None)
 
         complete_data = {
-            "collected_at":  datetime.now(timezone.utc).isoformat(),
-            "date":          today_str,
-            "source":        "FRED API",
-            "period":        {"start": self.start_date, "end": self.end_date},
-            "latest_values": latest_values,
-            "data":          results,
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "date":         today_str,
+            "mode":         mode,
+            "source":       "Finnhub",
+            "count":        len(all_events),
+            "events":       all_events,
         }
 
         # 日別アーカイブ保存
-        self.save_to_s3(f"{ym}/fred-{today_str}.json", complete_data)
+        self.save_to_s3(f"{ym}/calendar-{today_str}.json", complete_data)
 
         # latest.json（常に上書き）
         self.save_to_s3("latest.json", complete_data)
 
+        # 過去5年分一括取得の場合はhistoricalにも保存
+        if mode == "historical":
+            self.save_to_s3("historical/all-events.json", complete_data)
+
         print("\n収集完了サマリー")
         print("=" * 60)
-        for name, records in results.items():
-            status = f"{len(records)}件" if records else "失敗"
-            print(f"  {name}: {status}")
-        print(f"\n成功: {success_count}件 / 失敗: {fail_count}件")
+        print(f"  合計:     {len(all_events)}件")
+        print(f"  高重要度: {high_count}件")
+        print(f"  中重要度: {medium_count}件")
+        print(f"  結果あり: {result_count}件")
         print("=" * 60)
 
-        return complete_data, success_count, fail_count
+        return all_events
 
 
 def notify_slack(status, message):
@@ -211,7 +222,7 @@ def notify_slack(status, message):
     payload = {
         "attachments": [{
             "color": color,
-            "title": f"{emoji} FRED経済指標収集",
+            "title": f"{emoji} Finnhub経済指標カレンダー収集",
             "text":  message,
             "footer": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }]
@@ -224,26 +235,30 @@ def notify_slack(status, message):
 
 
 def main():
-    """メイン実行"""
+    """
+    メイン実行
+    初回: python batch_finnhub_calendar.py historical
+    毎日: python batch_finnhub_calendar.py
+    """
+    import sys
+    mode = sys.argv[1] if len(sys.argv) > 1 else "daily"
+
     try:
-        collector = FredIndicatorsCollector()
-        complete_data, success_count, fail_count = collector.run_collection()
+        collector = FinnhubCalendarCollector()
+        events    = collector.run_collection(mode=mode)
 
         s3_path = f"s3://{collector.bucket_name}/{collector.s3_prefix}"
         print(f"\n処理完了")
         print(f"データ保存先: {s3_path}")
 
-        if fail_count == 0:
+        if events:
             notify_slack("success",
-                f"FRED経済指標収集が完了しました\n"
-                f"指標数: {success_count}件\n"
+                f"Finnhub経済指標カレンダー収集が完了しました\n"
+                f"モード: {mode} / 件数: {len(events)}件\n"
                 f"データ保存先: {s3_path}"
             )
         else:
-            notify_slack("failure",
-                f"FRED経済指標収集が一部失敗しました\n"
-                f"成功: {success_count}件 / 失敗: {fail_count}件"
-            )
+            notify_slack("failure", "Finnhub経済指標カレンダーの取得に失敗しました（0件）")
 
     except Exception as e:
         print(f"エラーが発生しました: {e}")
