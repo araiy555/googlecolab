@@ -251,9 +251,10 @@ class FinnhubCalendarCollector:
                 time.sleep(SLEEP_BETWEEN_REQUESTS)
 
         else:
-            # 直近7日分を取得
+            # 過去7日 + 未来14日を取得（今週・来週の予定も含む）
             from_date  = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-            new_events = self.fetch_calendar(from_date, today_str)
+            to_date    = (datetime.now() + timedelta(days=14)).strftime('%Y-%m-%d')
+            new_events = self.fetch_calendar(from_date, to_date)
 
         if not new_events:
             print("✗ 新規イベントが0件のため保存をスキップします")
