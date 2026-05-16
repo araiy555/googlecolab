@@ -26,6 +26,7 @@ S3保存先:
 import boto3
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone, timedelta
 import requests
@@ -80,13 +81,22 @@ class FinnhubCalendarCollector:
 
             events = res.json().get("economicCalendar", [])
 
-            # 対象国フィルタ・正規化
+            # 対象国フィルタ・high impactのみ・正規化
             records = []
             for e in events:
                 if e.get("country", "") not in TARGET_COUNTRIES:
                     continue
+                if e.get("impact", "") != "high":
+                    continue
+
+                # dateが空の場合はtimeから補完
+                date_str = e.get("date", "")[:10]
+                if not date_str:
+                    time_str = e.get("time", "")
+                    date_str = time_str[:10] if time_str else ""
+
                 records.append({
-                    "date":     e.get("date", "")[:10],
+                    "date":     date_str,
                     "time":     e.get("time", ""),
                     "country":  e.get("country", ""),
                     "event":    e.get("event", ""),
@@ -146,8 +156,8 @@ class FinnhubCalendarCollector:
 
         if mode == "historical":
             # 月単位で分割して過去5年分を取得
-            current    = datetime.strptime(self.start_date, '%Y-%m-%d')
-            end        = datetime.strptime(self.end_date,   '%Y-%m-%d')
+            current = datetime.strptime(self.start_date, '%Y-%m-%d')
+            end     = datetime.strptime(self.end_date,   '%Y-%m-%d')
 
             while current < end:
                 from_date = current.strftime('%Y-%m-%d')
@@ -167,16 +177,13 @@ class FinnhubCalendarCollector:
 
         else:
             # 直近7日分のみ取得
-            from_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            from_date  = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
             all_events = self.fetch_calendar(from_date, today_str)
 
         if not all_events:
             print("✗ イベントが0件のため保存をスキップします")
             return []
 
-        # 重要度別件数
-        high_count   = sum(1 for e in all_events if e["impact"] == "high")
-        medium_count = sum(1 for e in all_events if e["impact"] == "medium")
         result_count = sum(1 for e in all_events if e["actual"] is not None)
 
         complete_data = {
@@ -201,8 +208,6 @@ class FinnhubCalendarCollector:
         print("\n収集完了サマリー")
         print("=" * 60)
         print(f"  合計:     {len(all_events)}件")
-        print(f"  高重要度: {high_count}件")
-        print(f"  中重要度: {medium_count}件")
         print(f"  結果あり: {result_count}件")
         print("=" * 60)
 
@@ -240,7 +245,6 @@ def main():
     初回: python batch_finnhub_calendar.py historical
     毎日: python batch_finnhub_calendar.py
     """
-    import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else "daily"
 
     try:
