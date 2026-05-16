@@ -35,10 +35,8 @@ class FredIndicatorsCollector:
 
         self.bucket_name = "m-s3storage"
         self.s3_prefix = "fred-indicators/"
-        self.api_key = os.getenv("FRED_API_KEY")
+        self.api_key = os.getenv("FRED_API_KEY", "91935bcccf126bf926f4a17787036841")
 
-        if not self.api_key:
-            raise RuntimeError("FRED_API_KEYが設定されていません")
 
         # 取得対象指標: {指標名: FRED系列ID}
         self.indicators = {
