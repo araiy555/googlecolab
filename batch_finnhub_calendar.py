@@ -2,6 +2,7 @@
 """
 Finnhub経済指標カレンダー収集システム（GitHub Actions用）
 Finnhub APIから経済指標カレンダー（発表日時・予想・結果・前回値）を取得しS3に保存する
+deep-translatorでイベント名を日本語に翻訳してevent_jaフィールドに追加する
 
 参考: market_indicators_collector.py と同じ構造・スタイルで実装
 
@@ -16,6 +17,7 @@ S3保存先:
     "time":     "2024-11-01T12:30:00",
     "country":  "US",
     "event":    "Non-Farm Payrolls",
+    "event_ja": "非農業部門雇用者数",
     "impact":   "high",
     "previous": 254000,
     "estimate": 220000,
@@ -31,6 +33,14 @@ import time
 from datetime import datetime, timezone, timedelta
 import requests
 
+try:
+    from deep_translator import GoogleTranslator
+    TRANSLATOR_AVAILABLE = True
+except ImportError:
+    TRANSLATOR_AVAILABLE = False
+    print("⚠️  deep-translatorが未インストール。翻訳をスキップします。")
+    print("   pip install deep-translator でインストールしてください。")
+
 # Finnhub API
 FINNHUB_URL = "https://finnhub.io/api/v1/calendar/economic"
 FINNHUB_KEY = "d83utn1r01qkm5c9l6s0d83utn1r01qkm5c9l6sg"
@@ -40,6 +50,9 @@ TARGET_COUNTRIES = {"US", "JP", "EU", "GB", "CN", "AU", "CA"}
 
 # レートリミット対策（無料プランは60回/分）
 SLEEP_BETWEEN_REQUESTS = 2
+
+# 翻訳APIのリクエスト間隔（秒）
+SLEEP_BETWEEN_TRANSLATIONS = 0.5
 
 
 class FinnhubCalendarCollector:
@@ -54,6 +67,15 @@ class FinnhubCalendarCollector:
         self.start_date = (datetime.now() - timedelta(days=365 * 5)).strftime('%Y-%m-%d')
         self.end_date   = datetime.now().strftime('%Y-%m-%d')
 
+        # 翻訳キャッシュ（同じイベント名を何度も翻訳しないようにする）
+        self.translation_cache = {}
+
+        # Google翻訳インスタンス
+        if TRANSLATOR_AVAILABLE:
+            self.translator = GoogleTranslator(source='en', target='ja')
+        else:
+            self.translator = None
+
         self.s3 = self._init_s3_client()
         print("初期化完了")
 
@@ -67,6 +89,29 @@ class FinnhubCalendarCollector:
             print(f"S3初期化失敗: {e}")
             return None
 
+    def _translate(self, text):
+        """
+        イベント名を日本語に翻訳する
+        - キャッシュがあればそれを返す
+        - 翻訳失敗時は元の英語テキストをそのまま返す
+        """
+        if not self.translator or not text:
+            return text
+
+        # キャッシュヒット
+        if text in self.translation_cache:
+            return self.translation_cache[text]
+
+        try:
+            translated = self.translator.translate(text)
+            self.translation_cache[text] = translated
+            time.sleep(SLEEP_BETWEEN_TRANSLATIONS)
+            return translated
+        except Exception as e:
+            print(f"  ⚠️  翻訳失敗（{text}）: {e} → 英語のまま使用")
+            self.translation_cache[text] = text
+            return text
+
     def _load_existing_events(self):
         """S3のhistorical/all-events.jsonから既存データを読み込む"""
         try:
@@ -75,6 +120,12 @@ class FinnhubCalendarCollector:
             data = json.loads(res['Body'].read().decode('utf-8'))
             events = data.get("events", [])
             print(f"✓ 既存データ読み込み完了: {len(events)}件")
+
+            # 既存データの翻訳キャッシュを復元（再翻訳を防ぐ）
+            for e in events:
+                if e.get("event") and e.get("event_ja"):
+                    self.translation_cache[e["event"]] = e["event_ja"]
+
             return events
         except Exception:
             print("既存データなし（初回実行）")
@@ -112,11 +163,17 @@ class FinnhubCalendarCollector:
                     time_str = e.get("time", "")
                     date_str = time_str[:10] if time_str else ""
 
+                event_name = e.get("event", "")
+
+                # イベント名を日本語に翻訳
+                event_ja = self._translate(event_name)
+
                 records.append({
                     "date":     date_str,
                     "time":     e.get("time", ""),
                     "country":  e.get("country", ""),
-                    "event":    e.get("event", ""),
+                    "event":    event_name,
+                    "event_ja": event_ja,
                     "impact":   e.get("impact", ""),
                     "previous": e.get("prev"),
                     "estimate": e.get("estimate"),
@@ -164,6 +221,7 @@ class FinnhubCalendarCollector:
         """
         print("=" * 60)
         print(f"Finnhub経済指標カレンダー収集開始（mode={mode}）")
+        print(f"翻訳機能: {'有効' if self.translator else '無効'}")
         print("=" * 60)
 
         today_str = datetime.now().strftime('%Y-%m-%d')
@@ -213,6 +271,7 @@ class FinnhubCalendarCollector:
         all_events.sort(key=lambda x: x.get("time", ""))
 
         print(f"\n新規追加: {len(added_events)}件 / 累積合計: {len(all_events)}件")
+        print(f"翻訳キャッシュ: {len(self.translation_cache)}件")
 
         result_count = sum(1 for e in all_events if e["actual"] is not None)
 
