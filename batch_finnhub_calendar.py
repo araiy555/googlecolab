@@ -8,7 +8,7 @@ Finnhub APIから経済指標カレンダー（発表日時・予想・結果・
 S3保存先:
   m-s3storage/finnhub-calendar/YYYY-MM/calendar-YYYY-MM-DD.json  # 日別アーカイブ
   m-s3storage/finnhub-calendar/latest.json                        # 常に最新を上書き
-  m-s3storage/finnhub-calendar/historical/all-events.json         # 全期間データ（初回のみ）
+  m-s3storage/finnhub-calendar/historical/all-events.json         # 全期間累積データ
 
 取得データのイメージ（1件）:
   {
@@ -66,6 +66,23 @@ class FinnhubCalendarCollector:
         except Exception as e:
             print(f"S3初期化失敗: {e}")
             return None
+
+    def _load_existing_events(self):
+        """S3のhistorical/all-events.jsonから既存データを読み込む"""
+        try:
+            key = f"{self.s3_prefix}historical/all-events.json"
+            res = self.s3.get_object(Bucket=self.bucket_name, Key=key)
+            data = json.loads(res['Body'].read().decode('utf-8'))
+            events = data.get("events", [])
+            print(f"✓ 既存データ読み込み完了: {len(events)}件")
+            return events
+        except Exception:
+            print("既存データなし（初回実行）")
+            return []
+
+    def _make_event_key(self, event):
+        """イベントの重複チェック用キーを生成する（time + country + event名）"""
+        return f"{event['time']}_{event['country']}_{event['event']}"
 
     def fetch_calendar(self, from_date, to_date):
         """Finnhub APIから指定期間の経済指標カレンダーを取得する"""
@@ -143,7 +160,7 @@ class FinnhubCalendarCollector:
         """
         データ収集実行
         mode: "historical" → 過去5年分一括取得（初回のみ）
-              "daily"      → 直近7日分取得（毎日のcron用）
+              "daily"      → 直近7日分取得し重複なしで累積追記
         """
         print("=" * 60)
         print(f"Finnhub経済指標カレンダー収集開始（mode={mode}）")
@@ -152,7 +169,7 @@ class FinnhubCalendarCollector:
         today_str = datetime.now().strftime('%Y-%m-%d')
         ym        = today_str[:7]
 
-        all_events = []
+        new_events = []
 
         if mode == "historical":
             # 月単位で分割して過去5年分を取得
@@ -170,19 +187,32 @@ class FinnhubCalendarCollector:
                 to_date = min(next_month - timedelta(days=1), end).strftime('%Y-%m-%d')
 
                 records = self.fetch_calendar(from_date, to_date)
-                all_events.extend(records)
+                new_events.extend(records)
 
                 current = next_month
                 time.sleep(SLEEP_BETWEEN_REQUESTS)
 
         else:
-            # 直近7日分のみ取得
+            # 直近7日分を取得
             from_date  = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-            all_events = self.fetch_calendar(from_date, today_str)
+            new_events = self.fetch_calendar(from_date, today_str)
 
-        if not all_events:
-            print("✗ イベントが0件のため保存をスキップします")
+        if not new_events:
+            print("✗ 新規イベントが0件のため保存をスキップします")
             return []
+
+        # 既存データを読み込んで重複チェック
+        existing_events = self._load_existing_events()
+        existing_keys   = {self._make_event_key(e) for e in existing_events}
+
+        # 新規のみ追加
+        added_events = [e for e in new_events if self._make_event_key(e) not in existing_keys]
+        all_events   = existing_events + added_events
+
+        # 日付順にソート
+        all_events.sort(key=lambda x: x.get("time", ""))
+
+        print(f"\n新規追加: {len(added_events)}件 / 累積合計: {len(all_events)}件")
 
         result_count = sum(1 for e in all_events if e["actual"] is not None)
 
@@ -195,20 +225,28 @@ class FinnhubCalendarCollector:
             "events":       all_events,
         }
 
-        # 日別アーカイブ保存
-        self.save_to_s3(f"{ym}/calendar-{today_str}.json", complete_data)
+        # 日別アーカイブ保存（その日取得した新規分のみ）
+        daily_data = {
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "date":         today_str,
+            "mode":         mode,
+            "source":       "Finnhub",
+            "count":        len(added_events),
+            "events":       added_events,
+        }
+        self.save_to_s3(f"{ym}/calendar-{today_str}.json", daily_data)
 
-        # latest.json（常に上書き）
-        self.save_to_s3("latest.json", complete_data)
+        # latest.json（直近7日分）
+        self.save_to_s3("latest.json", daily_data)
 
-        # 過去5年分一括取得の場合はhistoricalにも保存
-        if mode == "historical":
-            self.save_to_s3("historical/all-events.json", complete_data)
+        # historical/all-events.json（全期間累積）
+        self.save_to_s3("historical/all-events.json", complete_data)
 
         print("\n収集完了サマリー")
         print("=" * 60)
-        print(f"  合計:     {len(all_events)}件")
-        print(f"  結果あり: {result_count}件")
+        print(f"  新規追加:   {len(added_events)}件")
+        print(f"  累積合計:   {len(all_events)}件")
+        print(f"  結果あり:   {result_count}件")
         print("=" * 60)
 
         return all_events
@@ -258,7 +296,7 @@ def main():
         if events:
             notify_slack("success",
                 f"Finnhub経済指標カレンダー収集が完了しました\n"
-                f"モード: {mode} / 件数: {len(events)}件\n"
+                f"モード: {mode} / 累積: {len(events)}件\n"
                 f"データ保存先: {s3_path}"
             )
         else:
