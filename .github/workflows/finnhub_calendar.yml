@@ -25,7 +25,7 @@ jobs:
 
       - name: 依存ライブラリインストール
         run: |
-          pip install boto3 requests
+          pip install boto3 requests deep-translator
 
       - name: Finnhub経済指標カレンダー取得
         env:
