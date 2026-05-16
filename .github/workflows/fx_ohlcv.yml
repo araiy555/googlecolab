@@ -2,7 +2,7 @@ name: FX OHLCV データ取得
 
 on:
   schedule:
-    - cron: '0 21 * * *'  # 毎週月〜金 JST 06:00（UTC 21:00）
+    - cron: '0 11 * * *'  # 毎週月〜金 JST 06:00（UTC 21:00）
   workflow_dispatch:          # 手動実行も可能
 
 jobs:
