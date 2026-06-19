@@ -167,19 +167,19 @@ class YanoshinTDnetCollector:
             print(f" S3エラー:{e}", flush=True)
             return False
 
-      def get_target_months(self):
-        """直近 MONTHS_BACK ヶ月（既定2）。当月から遡って生成。"""
-        n = int(os.getenv('MONTHS_BACK', '2'))
-        t = datetime.now()
-        out = []
-        y, m = t.year, t.month
-        for _ in range(max(1, n)):
-            out.append((y, m))
-            m -= 1
-            if m == 0:
-                m = 12; y -= 1
-        out.reverse()  # 古い順
-        return out
+    def get_target_months(self):
+      """直近 MONTHS_BACK ヶ月（既定2）。当月から遡って生成。"""
+      n = int(os.getenv('MONTHS_BACK', '2'))
+      t = datetime.now()
+      out = []
+      y, m = t.year, t.month
+      for _ in range(max(1, n)):
+          out.append((y, m))
+          m -= 1
+          if m == 0:
+              m = 12; y -= 1
+      out.reverse()  # 古い順
+      return out
 
     def run(self):
         print("=" * 60); print("TDnet(Yanoshin) 開示収集開始"); print("=" * 60)
