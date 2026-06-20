@@ -9,18 +9,22 @@
 #   python mirror_disclosure_pdfs.py                # 当月+前月を処理
 #   python mirror_disclosure_pdfs.py 2026-06 2026-05
 
-import io, sys, json, time
+import sys, json, time
 from datetime import datetime
+from urllib.parse import unquote
 import boto3, requests
 
-BUCKET     = "m-s3storage"
-REGION     = "ap-northeast-1"
+BUCKET      = "m-s3storage"
+REGION      = "ap-northeast-1"
 JSON_PREFIX = "japan-stocks-5years-chart/monthly-disclosures"   # {YYYY-MM}.json
 PDF_PREFIX  = "disclosure-pdf"                                   # ミラー先
 S3_BASE     = f"https://{BUCKET}.s3.{REGION}.amazonaws.com"
 
 s3 = boto3.client("s3", region_name=REGION)
-HEADERS = {"User-Agent": "Mozilla/5.0 (disclosure-mirror)"}
+
+# セッションを使い回して接続を再利用(プロキシ非経由でTDnet直叩き)
+_session = requests.Session()
+_session.headers.update({"User-Agent": "Mozilla/5.0 (disclosure-mirror)"})
 
 
 def months_to_process(argv):
@@ -51,28 +55,54 @@ def s3_exists(key):
         return False
 
 
+def direct_tdnet_url(url):
+    """やのしんプロキシ(rd.php?...)なら、埋め込まれた本物のTDnet URLを取り出す。"""
+    if "rd.php?" in url:
+        url = url.split("rd.php?", 1)[1]
+        url = unquote(url)            # 念のためURLデコード
+    return url
+
+
+def download_pdf(url, timeout=30, retries=4):
+    """TDnet本体から直接DL。失敗時は指数バックオフでリトライ。Noneなら諦める。"""
+    target = direct_tdnet_url(url)
+    backoff = 2
+    for attempt in range(retries):
+        try:
+            r = _session.get(target, timeout=timeout)
+            if r.status_code == 200 and r.content:
+                return r.content
+            if r.status_code in (403, 404):      # もう消えている → リトライ無駄
+                print(f"[dead] {target} ({r.status_code})")
+                return None
+            print(f"[retry] {target} ({r.status_code})")
+        except requests.RequestException as e:
+            print(f"[retry] {target}: {e}")
+        if attempt < retries - 1:
+            time.sleep(backoff)
+            backoff *= 2                          # 2s, 4s, 8s
+    print(f"[err] {target}: リトライ上限")
+    return None
+
+
 def mirror_pdf(src_url, month, code, seq):
     """TDnetのPDFをS3へコピーし、S3のURLを返す。失敗時はNone。"""
     yyyy, mm = month.split("-")
     code4 = str(code).zfill(4)
     dst_key = f"{PDF_PREFIX}/{yyyy}/{mm}/{code4}_{seq}.pdf"
 
-    if s3_exists(dst_key):                       # 冪等: 既にミラー済みなら即返す
+    if s3_exists(dst_key):                        # 冪等: 既にミラー済みなら即返す
         return f"{S3_BASE}/{dst_key}"
-    try:
-        r = requests.get(src_url, headers=HEADERS, timeout=20)
-        if r.status_code != 200 or not r.content:
-            print(f"[dead] {src_url} ({r.status_code})")
-            return None
-        s3.put_object(
-            Bucket=BUCKET, Key=dst_key, Body=r.content,
-            ContentType="application/pdf",
-        )
-        print(f"[mirror] {code4} -> {dst_key}")
-        return f"{S3_BASE}/{dst_key}"
-    except Exception as e:
-        print(f"[err] {src_url}: {e}")
+
+    content = download_pdf(src_url)
+    if not content:
         return None
+    s3.put_object(
+        Bucket=BUCKET, Key=dst_key, Body=content,
+        ContentType="application/pdf",
+    )
+    print(f"[mirror] {code4} -> {dst_key}")
+    return f"{S3_BASE}/{dst_key}"
 
 
 def process(month):
@@ -85,13 +115,13 @@ def process(month):
         url = (d.get("pdf_url") or "").strip()
         if not url:
             continue
-        if url.startswith(S3_BASE):              # 既にS3 → 何もしない
+        if url.startswith(S3_BASE):               # 既にS3 → 何もしない
             continue
         new_url = mirror_pdf(url, month, d.get("stock_code", "0"), i)
         if new_url:
             d["pdf_url"] = new_url
             changed = True
-        time.sleep(0.2)                          # TDnetへの負荷を抑える
+        time.sleep(0.3)                           # TDnetへの負荷を抑える
     if changed:
         s3.put_object(
             Bucket=BUCKET, Key=key,
