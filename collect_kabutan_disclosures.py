@@ -20,7 +20,7 @@ REGION      = "ap-northeast-1"
 JSON_PREFIX = "japan-stocks-5years-chart/monthly-disclosures"   # {YYYY-MM}.json
 PDF_PREFIX  = "disclosure-pdf"                                   # ミラー先
 S3_BASE     = f"https://{BUCKET}.s3.{REGION}.amazonaws.com"
-WINDOW_DAYS = 5                                                 # 毎日実行前提。直近5日分だけ見る(取りこぼし/再挑戦の保険込み)
+WINDOW_DAYS = 30                                                 # 毎日実行前提。直近5日分だけ見る(取りこぼし/再挑戦の保険込み)
 
 s3 = boto3.client("s3", region_name=REGION)
 
