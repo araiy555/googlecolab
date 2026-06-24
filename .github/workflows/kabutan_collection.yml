@@ -3,39 +3,37 @@ name: Kabutan Monthly Disclosures
 on:
   schedule:
     - cron: '0 12 * * *'  # 毎日UTC 18時（日本時間翌日1時）
-  workflow_dispatch:
-    inputs:
-      FROM:
-        description: 'backfill 開始日 (YYYY-MM-DD)。空なら直近のみ'
-        required: false
-      TO:
-        description: 'backfill 終了日 (YYYY-MM-DD)'
-        required: false
+  workflow_dispatch:  # 手動実行も可能
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 360  # 6時間まで
 
     steps:
       - uses: actions/checkout@v4
-
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
+      
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install requests boto3
-
-      - name: Run Disclosure Collection
+          pip install requests beautifulsoup4 boto3
+      
+      - name: Run Kabutan Disclosure Collection
         env:
-          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ap-northeast-1
-          FROM: ${{ github.event.inputs.FROM }}
-          TO: ${{ github.event.inputs.TO }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python collect_kabutan_disclosures.py
+      
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kabutan-results
+          path: logs/
+          retention-days: 7
