@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # collect_kabutan_disclosures.py
-# Yanoshin TDnet APIで適時開示(タイトル等)を取得し、PDFをS3に保存して
-# monthly-disclosures(YYYY-MM.json)に書き出す。これ1本で完結。
+# TDnet本体(release.tdnet.info)から適時開示(タイトル等)を取得し、PDFをS3に保存して
+# monthly-disclosures(YYYY-MM.json)に書き出す。これ1本で完結。yanoshin不使用。
 #
-#   pip install boto3 requests
+#   pip install boto3 requests beautifulsoup4
 #   python collect_kabutan_disclosures.py                       # 直近7日
-#   FROM=2026-06-01 TO=2026-06-24 python collect_kabutan_disclosures.py   # 期間指定
+#   FROM=2026-06-01 TO=2026-06-24 python collect_kabutan_disclosures.py
 
 import os, sys, json, time
 from datetime import datetime, timedelta
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 import boto3, requests
+from bs4 import BeautifulSoup
 
 BUCKET, REGION = "m-s3storage", "ap-northeast-1"
 JSON_PREFIX = "japan-stocks-5years-chart/monthly-disclosures"
 PDF_PREFIX  = "disclosure-pdf"
 S3_BASE     = f"https://{BUCKET}.s3.{REGION}.amazonaws.com"
-API = "https://webapi.yanoshin.jp/webapi/tdnet/list"
+TDNET = "https://www.release.tdnet.info/inbs"
 
 DAYS = int(os.environ.get("DAYS", "7"))
 FROM, TO = os.environ.get("FROM", ""), os.environ.get("TO", "")
@@ -43,23 +44,15 @@ def s3_exists(key):
         return False
 
 
-def direct_tdnet_url(url):
-    if "rd.php?" in url:
-        url = unquote(url.split("rd.php?", 1)[1])
-    return url
-
-
 def doc_id(url):
-    real = direct_tdnet_url(url)
-    return os.path.splitext(os.path.basename(urlparse(real).path))[0]
+    return os.path.splitext(os.path.basename(urlparse(url).path))[0]
 
 
 def download_pdf(url, retries=4):
-    target = direct_tdnet_url(url)
     backoff = 2
     for i in range(retries):
         try:
-            r = sess.get(target, timeout=30)
+            r = sess.get(url, timeout=30)
             if r.status_code == 200 and r.content:
                 return r.content
             if r.status_code in (403, 404):
@@ -72,7 +65,6 @@ def download_pdf(url, retries=4):
 
 
 def mirror_pdf(src_url, yyyy, mm):
-    """PDFをS3に保存しS3 URLを返す。冪等。失敗は空。"""
     did = doc_id(src_url)
     if not did:
         return ""
@@ -88,9 +80,34 @@ def mirror_pdf(src_url, yyyy, mm):
 
 
 def fetch_day(yyyymmdd):
-    r = sess.get(f"{API}/{yyyymmdd}.json", params={"limit": 1000}, timeout=30)
-    r.raise_for_status()
-    return r.json().get("items", [])
+    """TDnetのその日の開示を全ページscrape。code/title/pdf を返す。"""
+    out = []
+    for page in range(1, 40):
+        url = f"{TDNET}/I_list_{page:03d}_{yyyymmdd}.html"
+        try:
+            r = sess.get(url, timeout=30)
+        except requests.RequestException:
+            break
+        if r.status_code != 200:
+            break
+        r.encoding = r.apparent_encoding or "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+        titles = soup.find_all("td", class_="kjTitle")
+        if not titles:
+            break
+        for td in titles:
+            a = td.find("a")
+            tr = td.find_parent("tr")
+            code_td = tr.find("td", class_="kjCode") if tr else None
+            if not a or not code_td:
+                continue
+            href = a.get("href") or ""
+            out.append({
+                "code": code_td.get_text(strip=True),
+                "title": a.get_text(strip=True),
+                "pdf": f"{TDNET}/{href}" if href else "",
+            })
+    return out
 
 
 def load_month(ym):
@@ -107,18 +124,15 @@ def main():
             items = fetch_day(ymd)
         except Exception as e:
             print(f"[err] {ymd}: {e}"); continue
+        date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
         for it in items:
-            t = it.get("Tdnet") or it
-            code = str(t.get("company_code") or "").strip()
+            code = it["code"].strip()
             if len(code) == 5:
                 code = code[:-1]
-            title = str(t.get("title") or "").strip()
-            pubdate = str(t.get("pubdate") or "").strip()
-            date = pubdate[:10]
-            src = str(t.get("document_url") or t.get("url") or "").strip()
-            if not (code and date and title):
+            title = it["title"].strip()
+            if not (code and title):
                 continue
-            pdf_url = mirror_pdf(src, date[:4], date[5:7]) if src else ""
+            pdf_url = mirror_pdf(it["pdf"], date[:4], date[5:7]) if it["pdf"] else ""
             by_month.setdefault(date[:7], []).append({
                 "stock_code": code, "date": date, "title": title,
                 "category": "", "info_type": "", "pdf_url": pdf_url,
