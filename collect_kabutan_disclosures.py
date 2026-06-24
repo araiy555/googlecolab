@@ -1,166 +1,162 @@
 #!/usr/bin/env python3
-# mirror_disclosure_pdfs.py
-# 月次開示JSON(monthly-disclosures)を読み、各PDFをS3へミラーして
-# pdf_url を release.tdnet.info から S3 のURLに書き換える。
-# TDnetのPDFは約30日で消えるので「毎日」流すこと(古い分は取り返せない)。
-# 既に2ヶ月分ミラー済みなので、毎日の実行では直近数日分だけを見る。
+# collect_jquants_disclosures.py
+# J-Quants V2(bulk) から決算/開示を取得し、既存 monthly-disclosures(YYYY-MM.json) へマージ。
+# GitHub Action 用: AWS認証は環境変数、J-Quants APIキーは JQUANTS_API_KEY。
 #
 #   pip install boto3 requests
-#   AWS認証(環境変数 or ~/.aws)を設定して:
-#   python mirror_disclosure_pdfs.py                # 当月+前月(直近5日分)を処理
-#   python mirror_disclosure_pdfs.py 2026-06 2026-05
+#   JQUANTS_API_KEY=xxxx python collect_jquants_disclosures.py
+#   初回は DEBUG=1 で bulk構造とCSVヘッダを出力 → 列名を確定する。
 
-import os, sys, json, time
-from datetime import datetime
-from urllib.parse import unquote, urlparse
-import boto3, requests
+import os, sys, json, gzip, csv, tempfile, time
+from datetime import datetime, timedelta
+import requests, boto3
 
 BUCKET      = "m-s3storage"
 REGION      = "ap-northeast-1"
-JSON_PREFIX = "japan-stocks-5years-chart/monthly-disclosures"   # {YYYY-MM}.json
-PDF_PREFIX  = "disclosure-pdf"                                   # ミラー先
-S3_BASE     = f"https://{BUCKET}.s3.{REGION}.amazonaws.com"
-WINDOW_DAYS = 5                                                 # 毎日実行前提。直近5日分だけ見る(取りこぼし/再挑戦の保険込み)
+JSON_PREFIX = "japan-stocks-5years-chart/monthly-disclosures"   # 既存と同じ
+
+BASE_URL = "https://api.jquants.com/v2"
+API_KEY  = os.environ.get("JQUANTS_API_KEY", "")
+# ★要確認: 開示/決算のV2エンドポイント。tickは "/equities/trades"。
+ENDPOINT = os.environ.get("JQ_ENDPOINT", "/equities/financial_statements")
+YEARS    = int(os.environ.get("YEARS", "5"))
+DEBUG    = os.environ.get("DEBUG", "1") == "1"
 
 s3 = boto3.client("s3", region_name=REGION)
-
-# セッションを使い回して接続を再利用(プロキシ非経由でTDnet直叩き)
 _session = requests.Session()
-_session.headers.update({"User-Agent": "Mozilla/5.0 (disclosure-mirror)"})
+_session.headers.update({"x-api-key": API_KEY})
+
+PERIOD_LABEL = {"1Q": "第1四半期", "2Q": "第2四半期", "3Q": "第3四半期", "FY": "通期"}
 
 
-def months_to_process(argv):
-    if argv:
-        return argv
-    now = datetime.now()
-    prev = datetime(now.year, now.month, 1)
-    pm = (prev.month - 2) % 12 + 1
-    py = prev.year - (1 if prev.month == 1 else 0)
-    return [f"{now.year}-{now.month:02d}", f"{py}-{pm:02d}"]
-
-
-def load_json(month):
-    key = f"{JSON_PREFIX}/{month}.json"
-    try:
-        obj = s3.get_object(Bucket=BUCKET, Key=key)
-        return key, json.loads(obj["Body"].read())
-    except s3.exceptions.NoSuchKey:
-        print(f"[skip] {key} が存在しません")
-        return key, None
-
-
-def s3_exists(key):
-    try:
-        s3.head_object(Bucket=BUCKET, Key=key)
-        return True
-    except Exception:
-        return False
-
-
-def parse_date(s):
-    s = str(s)[:10]
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
+def bulk_list():
+    r = _session.get(f"{BASE_URL}/bulk/list", params={"endpoint": ENDPOINT}, timeout=30)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    if DEBUG and data:
+        print("=== bulk/list サンプル(先頭3件) ===")
+        for d in data[:3]:
+            print(json.dumps(d, ensure_ascii=False))
+    cutoff = (datetime.now() - timedelta(days=365 * YEARS)).strftime("%Y%m%d")
+    out = []
+    for f in data:
+        key = f.get("Key", "")
+        if "/live/" not in key:
             continue
-    return None
+        digits = "".join(c for c in key.split("/")[-1] if c.isdigit())
+        date8 = digits[:8] if len(digits) >= 8 else ""
+        if date8 and date8 >= cutoff:
+            out.append(key)
+    return out
 
 
-def out_of_window(date_str):
-    """直近WINDOW_DAYSより古い開示はTrue(既に保存済みなのでスキップ)。"""
-    d = parse_date(date_str)
-    if not d:
-        return False                      # 日付不明は念のため処理する
-    return (datetime.now() - d).days > WINDOW_DAYS
+def get_download_url(key):
+    r = _session.get(f"{BASE_URL}/bulk/get", params={"key": key}, timeout=30)
+    r.raise_for_status()
+    return r.json().get("url")
 
 
-def direct_tdnet_url(url):
-    """やのしんプロキシ(rd.php?...)なら、埋め込まれた本物のTDnet URLを取り出す。"""
-    if "rd.php?" in url:
-        url = unquote(url.split("rd.php?", 1)[1])   # 念のためURLデコード
-    return url
-
-
-def doc_id(url):
-    """TDnet URL末尾のドキュメントIDを返す。例: 140120260601558542"""
-    real = direct_tdnet_url(url)
-    return os.path.splitext(os.path.basename(urlparse(real).path))[0]
-
-
-def download_pdf(url, timeout=30, retries=4):
-    """TDnet本体から直接DL。失敗時は指数バックオフでリトライ。Noneなら諦める。"""
-    target = direct_tdnet_url(url)
-    backoff = 2
-    for attempt in range(retries):
+def make_title(row):
+    period = (row.get("TypeOfCurrentPeriod") or "").strip()
+    fy = (row.get("CurrentFiscalYearEndDate") or row.get("CurrentPeriodEndDate") or "").strip()
+    ym = ""
+    if len(fy) >= 7:
         try:
-            r = _session.get(target, timeout=timeout)
-            if r.status_code == 200 and r.content:
-                return r.content
-            if r.status_code in (403, 404):      # もう消えている → リトライ無駄
-                print(f"[dead] {target} ({r.status_code})")
-                return None
-            print(f"[retry] {target} ({r.status_code})")
-        except requests.RequestException as e:
-            print(f"[retry] {target}: {e}")
-        if attempt < retries - 1:
-            time.sleep(backoff)
-            backoff *= 2                          # 2s, 4s, 8s
-    print(f"[err] {target}: リトライ上限")
-    return None
+            ym = f"{fy[:4]}年{int(fy[5:7])}月期"
+        except Exception:
+            ym = ""
+    return f"{ym} {PERIOD_LABEL.get(period, period)} 決算短信".strip()
 
 
-def mirror_pdf(src_url, month):
-    """TDnetのPDFをS3へコピーし、S3のURLを返す。失敗時はNone。"""
-    yyyy, mm = month.split("-")
-    did = doc_id(src_url)
-    dst_key = f"{PDF_PREFIX}/{yyyy}/{mm}/{did}.pdf"   # 文書IDで一意(配列順に依存しない)
-
-    if s3_exists(dst_key):                        # 冪等: 既にミラー済みなら即返す
-        return f"{S3_BASE}/{dst_key}"
-
-    content = download_pdf(src_url)
-    if not content:
+def row_to_disclosure(row):
+    code = (row.get("LocalCode") or row.get("Code") or "").strip()
+    if len(code) == 5:
+        code = code[:-1]
+    date = (row.get("DisclosedDate") or row.get("Date") or "").strip()
+    if not code or not date:
         return None
+    return {
+        "stock_code": code,
+        "date": date,
+        "title": make_title(row),
+        "category": "決算",
+        "info_type": (row.get("TypeOfDocument") or "").strip(),
+        "pdf_url": "",                     # J-QuantsはPDFなし(mirrorはTDnet側だけ処理)
+    }
+
+
+def collect_from_file(key):
+    url = get_download_url(key)
+    entries = []
+    with tempfile.NamedTemporaryFile(suffix=".csv.gz", delete=True) as tmp:
+        r = _session.get(url, timeout=300, stream=True)
+        r.raise_for_status()
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            tmp.write(chunk)
+        tmp.flush()
+        with gzip.open(tmp.name, "rt", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if DEBUG and reader.fieldnames:
+                print("=== CSVヘッダ（列名）===")
+                print(", ".join(reader.fieldnames))
+            for row in reader:
+                e = row_to_disclosure(row)
+                if e:
+                    entries.append(e)
+    return entries
+
+
+def load_month(ym):
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=f"{JSON_PREFIX}/{ym}.json")
+        d = json.loads(obj["Body"].read())
+        return d.get("disclosures", []) if isinstance(d, dict) else []
+    except s3.exceptions.NoSuchKey:
+        return []
+    except Exception:
+        return []
+
+
+def save_month(ym, items):
     s3.put_object(
-        Bucket=BUCKET, Key=dst_key, Body=content,
-        ContentType="application/pdf",
+        Bucket=BUCKET, Key=f"{JSON_PREFIX}/{ym}.json",
+        Body=json.dumps({"disclosures": items}, ensure_ascii=False).encode("utf-8"),
+        ContentType="application/json",
     )
-    print(f"[mirror] {did} -> {dst_key}")
-    return f"{S3_BASE}/{dst_key}"
 
 
-def process(month):
-    key, data = load_json(month)
-    if not data:
-        return
-    items = data.get("disclosures") or []
-    changed = False
-    for d in items:
-        url = (d.get("pdf_url") or "").strip()
-        if not url:
+def main():
+    if not API_KEY:
+        print("JQUANTS_API_KEY 未設定"); sys.exit(1)
+    print(f"=== J-Quants開示取得 endpoint={ENDPOINT} years={YEARS} ===")
+    files = bulk_list()
+    print(f"対象ファイル: {len(files)} 件")
+
+    by_month = {}
+    for i, key in enumerate(files):
+        try:
+            for e in collect_from_file(key):
+                by_month.setdefault(e["date"][:7], []).append(e)
+            if DEBUG and i == 0:
+                print("▲構造を確認したら DEBUG=0 で本実行")
+            time.sleep(1)
+        except Exception as ex:
+            print(f"[err] {key}: {ex}")
+
+    total = 0
+    for ym, news in by_month.items():
+        existing = load_month(ym)
+        seen = {f"{d.get('stock_code')}|{d.get('date')}|{d.get('title')}" for d in existing}
+        added = [e for e in news if f"{e['stock_code']}|{e['date']}|{e['title']}" not in seen]
+        if not added:
             continue
-        if url.startswith(S3_BASE):               # 既にS3 → 何もしない
-            continue
-        if out_of_window(d.get("date")):          # 直近5日より古い → スキップ
-            continue
-        new_url = mirror_pdf(url, month)
-        if new_url:
-            d["pdf_url"] = new_url
-            changed = True
-        time.sleep(0.3)                           # TDnetへの負荷を抑える
-    if changed:
-        s3.put_object(
-            Bucket=BUCKET, Key=key,
-            Body=json.dumps(data, ensure_ascii=False).encode("utf-8"),
-            ContentType="application/json",
-        )
-        print(f"[save] {key} を更新しました")
-    else:
-        print(f"[save] {key} 変更なし")
+        merged = existing + added
+        merged.sort(key=lambda d: d.get("date", ""), reverse=True)
+        save_month(ym, merged)
+        total += len(added)
+        print(f"[save] {ym}: +{len(added)} (計 {len(merged)})")
+    print(f"=== 完了: 新規 {total} 件 / {len(by_month)} ヶ月 ===")
 
 
 if __name__ == "__main__":
-    for m in months_to_process(sys.argv[1:]):
-        print(f"=== {m} ===")
-        process(m)
+    main()
