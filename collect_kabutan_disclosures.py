@@ -1,139 +1,166 @@
 #!/usr/bin/env python3
-# jquants_disclosures.py
-# J-Quants /td/list で適時開示一覧(最大5年)を取得し、各PDFを /td/files から
-# S3(disclosure-pdf/YYYY/MM/{discNo}.pdf)へ保存、monthly-disclosures に書き出す。
-# GitHub Action 用。AWS認証=環境変数(secrets)、J-Quants=JQUANTS_API_KEY。冪等。
+# mirror_disclosure_pdfs.py
+# 月次開示JSON(monthly-disclosures)を読み、各PDFをS3へミラーして
+# pdf_url を release.tdnet.info から S3 のURLに書き換える。
+# TDnetのPDFは約30日で消えるので「毎日」流すこと(古い分は取り返せない)。
+# 既に2ヶ月分ミラー済みなので、毎日の実行では直近数日分だけを見る。
 #
 #   pip install boto3 requests
-#   日次:        JQUANTS_API_KEY=xxx python jquants_disclosures.py
-#   5年backfill: JQUANTS_API_KEY=xxx FROM=2021-01-01 TO=2021-12-31 python jquants_disclosures.py
+#   AWS認証(環境変数 or ~/.aws)を設定して:
+#   python mirror_disclosure_pdfs.py                # 当月+前月(直近5日分)を処理
+#   python mirror_disclosure_pdfs.py 2026-06 2026-05
 
 import os, sys, json, time
-from datetime import datetime, timedelta
-import requests, boto3
+from datetime import datetime
+from urllib.parse import unquote, urlparse
+import boto3, requests
 
-BUCKET, REGION = "m-s3storage", "ap-northeast-1"
-JSON_PREFIX = "japan-stocks-5years-chart/monthly-disclosures"
-PDF_PREFIX  = "disclosure-pdf"
+BUCKET      = "m-s3storage"
+REGION      = "ap-northeast-1"
+JSON_PREFIX = "japan-stocks-5years-chart/monthly-disclosures"   # {YYYY-MM}.json
+PDF_PREFIX  = "disclosure-pdf"                                   # ミラー先
 S3_BASE     = f"https://{BUCKET}.s3.{REGION}.amazonaws.com"
-
-BASE_URL = "https://api.jquants.com/v2"
-API_KEY  = os.environ.get("JQUANTS_API_KEY", "")
-DAYS = int(os.environ.get("DAYS", "7"))
-FROM, TO = os.environ.get("FROM", ""), os.environ.get("TO", "")
+WINDOW_DAYS = 5                                                 # 毎日実行前提。直近5日分だけ見る(取りこぼし/再挑戦の保険込み)
 
 s3 = boto3.client("s3", region_name=REGION)
-sess = requests.Session()
-sess.headers.update({"x-api-key": API_KEY})
+
+# セッションを使い回して接続を再利用(プロキシ非経由でTDnet直叩き)
+_session = requests.Session()
+_session.headers.update({"User-Agent": "Mozilla/5.0 (disclosure-mirror)"})
 
 
-def date_range():
-    if FROM and TO:
-        a = datetime.strptime(FROM[:10], "%Y-%m-%d"); b = datetime.strptime(TO[:10], "%Y-%m-%d")
-    else:
-        b = datetime.now(); a = b - timedelta(days=DAYS)
-    d = a
-    while d <= b:
-        yield d.strftime("%Y-%m-%d"); d += timedelta(days=1)
+def months_to_process(argv):
+    if argv:
+        return argv
+    now = datetime.now()
+    prev = datetime(now.year, now.month, 1)
+    pm = (prev.month - 2) % 12 + 1
+    py = prev.year - (1 if prev.month == 1 else 0)
+    return [f"{now.year}-{now.month:02d}", f"{py}-{pm:02d}"]
+
+
+def load_json(month):
+    key = f"{JSON_PREFIX}/{month}.json"
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
+        return key, json.loads(obj["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        print(f"[skip] {key} が存在しません")
+        return key, None
 
 
 def s3_exists(key):
     try:
-        s3.head_object(Bucket=BUCKET, Key=key); return True
+        s3.head_object(Bucket=BUCKET, Key=key)
+        return True
     except Exception:
         return False
 
 
-def td_list_day(date):
-    rows, pkey = [], None
-    while True:
-        p = {"date": date}
-        if pkey:
-            p["pagination_key"] = pkey
-        r = sess.get(f"{BASE_URL}/td/list", params=p, timeout=30)
-        if r.status_code == 404:
-            break
-        r.raise_for_status()
-        j = r.json()
-        rows += j.get("td_list") or j.get("data") or j.get("disclosures") or []
-        pkey = j.get("pagination_key")
-        if not pkey:
-            break
-        time.sleep(0.2)
-    return rows
-
-
-def mirror_pdf(disc_no, yyyy, mm):
-    dst = f"{PDF_PREFIX}/{yyyy}/{mm}/{disc_no}.pdf"
-    if s3_exists(dst):
-        return f"{S3_BASE}/{dst}"
-    r = sess.get(f"{BASE_URL}/td/files", params={"discNo": disc_no, "docs": "g"}, timeout=30)
-    if r.status_code == 404:
-        return ""
-    r.raise_for_status()
-    url = (r.json().get("files") or {}).get("pdf")
-    if not url:
-        return ""
-    pdf = sess.get(url, timeout=60)
-    if pdf.status_code != 200 or not pdf.content:
-        return ""
-    s3.put_object(Bucket=BUCKET, Key=dst, Body=pdf.content, ContentType="application/pdf")
-    print(f"  [pdf] {disc_no}")
-    return f"{S3_BASE}/{dst}"
-
-
-def load_month(ym):
-    try:
-        body = s3.get_object(Bucket=BUCKET, Key=f"{JSON_PREFIX}/{ym}.json")["Body"].read()
-        return json.loads(body).get("disclosures", [])
-    except Exception:
-        return []
-
-
-def main():
-    if not API_KEY:
-        print("JQUANTS_API_KEY 未設定"); sys.exit(1)
-
-    by_month = {}
-    for date in date_range():
+def parse_date(s):
+    s = str(s)[:10]
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
         try:
-            rows = td_list_day(date)
-        except Exception as e:
-            print(f"[err] {date}: {e}"); continue
-        for row in rows:
-            if str(row.get("DiscStatus") or "") == "delete":
-                continue
-            code = str(row.get("Code") or "")
-            if len(code) == 5:
-                code = code[:-1]
-            ddate = str(row.get("DiscDate") or "")
-            title = str(row.get("Title") or "")
-            disc  = str(row.get("DiscNo") or "")
-            if not (code and ddate and title and disc):
-                continue
-            pdf_url = mirror_pdf(disc, ddate[:4], ddate[5:7]) if "g" in (row.get("Docs") or []) else ""
-            by_month.setdefault(ddate[:7], []).append({
-                "stock_code": code, "date": ddate, "title": title,
-                "category": "適時開示", "info_type": "", "pdf_url": pdf_url, "disc_no": disc,
-            })
-        time.sleep(0.15)
-
-    total = 0
-    for ym, news in by_month.items():
-        existing = load_month(ym)
-        seen = {d.get("disc_no") for d in existing if d.get("disc_no")}
-        added = [e for e in news if e["disc_no"] not in seen]
-        if not added:
+            return datetime.strptime(s, fmt)
+        except ValueError:
             continue
-        merged = existing + added
-        merged.sort(key=lambda d: d.get("date", ""), reverse=True)
-        s3.put_object(Bucket=BUCKET, Key=f"{JSON_PREFIX}/{ym}.json",
-                      Body=json.dumps({"disclosures": merged}, ensure_ascii=False).encode("utf-8"),
-                      ContentType="application/json")
-        total += len(added)
-        print(f"[save] {ym}: +{len(added)}")
-    print(f"=== 完了: 新規 {total} 件 ===")
+    return None
+
+
+def out_of_window(date_str):
+    """直近WINDOW_DAYSより古い開示はTrue(既に保存済みなのでスキップ)。"""
+    d = parse_date(date_str)
+    if not d:
+        return False                      # 日付不明は念のため処理する
+    return (datetime.now() - d).days > WINDOW_DAYS
+
+
+def direct_tdnet_url(url):
+    """やのしんプロキシ(rd.php?...)なら、埋め込まれた本物のTDnet URLを取り出す。"""
+    if "rd.php?" in url:
+        url = unquote(url.split("rd.php?", 1)[1])   # 念のためURLデコード
+    return url
+
+
+def doc_id(url):
+    """TDnet URL末尾のドキュメントIDを返す。例: 140120260601558542"""
+    real = direct_tdnet_url(url)
+    return os.path.splitext(os.path.basename(urlparse(real).path))[0]
+
+
+def download_pdf(url, timeout=30, retries=4):
+    """TDnet本体から直接DL。失敗時は指数バックオフでリトライ。Noneなら諦める。"""
+    target = direct_tdnet_url(url)
+    backoff = 2
+    for attempt in range(retries):
+        try:
+            r = _session.get(target, timeout=timeout)
+            if r.status_code == 200 and r.content:
+                return r.content
+            if r.status_code in (403, 404):      # もう消えている → リトライ無駄
+                print(f"[dead] {target} ({r.status_code})")
+                return None
+            print(f"[retry] {target} ({r.status_code})")
+        except requests.RequestException as e:
+            print(f"[retry] {target}: {e}")
+        if attempt < retries - 1:
+            time.sleep(backoff)
+            backoff *= 2                          # 2s, 4s, 8s
+    print(f"[err] {target}: リトライ上限")
+    return None
+
+
+def mirror_pdf(src_url, month):
+    """TDnetのPDFをS3へコピーし、S3のURLを返す。失敗時はNone。"""
+    yyyy, mm = month.split("-")
+    did = doc_id(src_url)
+    dst_key = f"{PDF_PREFIX}/{yyyy}/{mm}/{did}.pdf"   # 文書IDで一意(配列順に依存しない)
+
+    if s3_exists(dst_key):                        # 冪等: 既にミラー済みなら即返す
+        return f"{S3_BASE}/{dst_key}"
+
+    content = download_pdf(src_url)
+    if not content:
+        return None
+    s3.put_object(
+        Bucket=BUCKET, Key=dst_key, Body=content,
+        ContentType="application/pdf",
+    )
+    print(f"[mirror] {did} -> {dst_key}")
+    return f"{S3_BASE}/{dst_key}"
+
+
+def process(month):
+    key, data = load_json(month)
+    if not data:
+        return
+    items = data.get("disclosures") or []
+    changed = False
+    for d in items:
+        url = (d.get("pdf_url") or "").strip()
+        if not url:
+            continue
+        if url.startswith(S3_BASE):               # 既にS3 → 何もしない
+            continue
+        if out_of_window(d.get("date")):          # 直近5日より古い → スキップ
+            continue
+        new_url = mirror_pdf(url, month)
+        if new_url:
+            d["pdf_url"] = new_url
+            changed = True
+        time.sleep(0.3)                           # TDnetへの負荷を抑える
+    if changed:
+        s3.put_object(
+            Bucket=BUCKET, Key=key,
+            Body=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+        )
+        print(f"[save] {key} を更新しました")
+    else:
+        print(f"[save] {key} 変更なし")
 
 
 if __name__ == "__main__":
-    main()
+    for m in months_to_process(sys.argv[1:]):
+        print(f"=== {m} ===")
+        process(m)
