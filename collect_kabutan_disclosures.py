@@ -133,12 +133,18 @@ class YanoshinTDnetCollector:
     # ── 1ヶ月分 ──
     def fetch_month(self, year, month):
         last_day = calendar.monthrange(year, month)[1]
+        start = f"{year}{month:02d}01"
+        end   = f"{year}{month:02d}{last_day:02d}"
+        # 範囲クエリで1ヶ月を1リクエスト（日ごと連打をやめる＝弾かれない）
+        url = f"{self.api_base}/{start}-{end}.json?limit=5000"
+        data = self._fetch_json(url)
+        items = (data.get('items') if isinstance(data, dict) else data) or []
         records = []
-        for day in range(1, last_day + 1):
-            ymd = f"{year}{month:02d}{day:02d}"
-            recs = self._fetch_day(ymd, year, month)
-            if recs:
-                records.extend(recs)
+        for it in items:
+            t = it.get('Tdnet') if isinstance(it, dict) and 'Tdnet' in it else it
+            rec = self._map_item(t, year, month)
+            if rec:
+                records.append(rec)
         # 重複除去
         seen, uniq = set(), []
         for r in records:
