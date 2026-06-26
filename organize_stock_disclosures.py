@@ -131,27 +131,31 @@ class StockBasedDataOrganizer:
         title = disclosure.get('title', '')
         return f"{stock_code}_{date}_{title}"
 
-    def merge_disclosures(self, existing: List[Dict], new: List[Dict]) -> List[Dict]:
-        """既存データと新規データをマージ（重複排除）"""
-        # 既存データのキーセット作成
-        existing_keys = {self.create_disclosure_key(d) for d in existing}
-        
+        def merge_disclosures(self, existing: List[Dict], new: List[Dict]) -> List[Dict]:
+        """既存データと新規データをマージ（重複排除＋pdf_urlバックフィル）"""
+        # 既存をキー→レコードで引けるように
+        existing_map = {self.create_disclosure_key(d): d for d in existing}
+
         merged = existing.copy()
         new_count = 0
         duplicate_count = 0
-        
+
         for disclosure in new:
             key = self.create_disclosure_key(disclosure)
-            if key not in existing_keys:
+            if key not in existing_map:
                 merged.append(disclosure)
-                existing_keys.add(key)
+                existing_map[key] = disclosure
                 new_count += 1
             else:
+                # 重複でも、既存にpdf_urlが無くて新規にあれば埋める
+                old = existing_map[key]
+                if not old.get('pdf_url') and disclosure.get('pdf_url'):
+                    old['pdf_url'] = disclosure['pdf_url']
                 duplicate_count += 1
-        
+
         self.stats['new_disclosures'] += new_count
         self.stats['duplicate_disclosures'] += duplicate_count
-        
+
         return merged
 
     def load_all_monthly_data(self) -> Dict[str, List[Dict]]:
