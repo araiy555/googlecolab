@@ -131,7 +131,7 @@ class StockBasedDataOrganizer:
         title = disclosure.get('title', '')
         return f"{stock_code}_{date}_{title}"
 
-        def merge_disclosures(self, existing: List[Dict], new: List[Dict]) -> List[Dict]:
+    def merge_disclosures(self, existing: List[Dict], new: List[Dict]) -> List[Dict]:
         """既存データと新規データをマージ（重複排除＋pdf_urlバックフィル）"""
         # 既存をキー→レコードで引けるように
         existing_map = {self.create_disclosure_key(d): d for d in existing}
