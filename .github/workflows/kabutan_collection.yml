@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 12 * * *'  # 毎日UTC 18時（日本時間翌日1時）
   workflow_dispatch:  # 手動実行も可能
+    inputs:
+      months_back:
+        description: '何か月さかのぼって取り直すか（毎日の自動実行は2）'
+        required: false
+        default: '2'
 
 jobs:
   collect:
@@ -28,6 +33,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MONTHS_BACK: ${{ github.event.inputs.months_back || '2' }}
         run: python collect_kabutan_disclosures.py
       
       - name: Upload results
