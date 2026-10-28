@@ -81,14 +81,18 @@ class YanoshinTDnetCollector:
             code = code[:4]
         if not code:
             return None
-        pub = str(t.get('pubdate') or '')
-        date_str = pub[:10] if len(pub) >= 10 else f"{year}-{month:02d}-01"
+        pub = str(t.get('pubdate') or '').strip()
+        if len(pub) < 10:            # 公表日時が無いものは入れない（月初に丸めると誤った日付になる）
+            return None
+        date_str = pub[:10]
+        time_str = pub[11:16] if len(pub) >= 16 else ''   # 公表時刻 HH:MM
         title = (t.get('title') or '不明').strip() or '不明'
         return {
             'stock_code': code,
             'company_name': (t.get('company_name') or '不明').strip(),
             'title': title,
             'date': date_str,
+            'time': time_str,
             'market': t.get('markets_string') or '',
             'info_type': '',
             'category': self._categorize(title),
@@ -108,10 +112,14 @@ class YanoshinTDnetCollector:
 
     # ── 1日分（ページング: offsetを実件数で進める）──
     def _fetch_day(self, dstr, year, month):
-        base = f"{self.api_base}/{dstr}.json"
+        return self._fetch_paged(dstr, year, month, self.page_limit)
+
+    # ── 日付・範囲クエリをページングで全件取る ──
+    def _fetch_paged(self, query, year, month, limit):
+        base = f"{self.api_base}/{query}.json"
         out, seen, offset = [], set(), 0
         for _ in range(80):  # 安全上限
-            data = self._fetch_json(f"{base}?limit={self.page_limit}&start={offset}")
+            data = self._fetch_json(f"{base}?limit={limit}&start={offset}")
             items = (data.get('items') if isinstance(data, dict) else data) or []
             if not items:
                 break
@@ -135,16 +143,9 @@ class YanoshinTDnetCollector:
         last_day = calendar.monthrange(year, month)[1]
         start = f"{year}{month:02d}01"
         end   = f"{year}{month:02d}{last_day:02d}"
-        # 範囲クエリで1ヶ月を1リクエスト（日ごと連打をやめる＝弾かれない）
-        url = f"{self.api_base}/{start}-{end}.json?limit=5000"
-        data = self._fetch_json(url)
-        items = (data.get('items') if isinstance(data, dict) else data) or []
-        records = []
-        for it in items:
-            t = it.get('Tdnet') if isinstance(it, dict) and 'Tdnet' in it else it
-            rec = self._map_item(t, year, month)
-            if rec:
-                records.append(rec)
+        # 範囲クエリで1ヶ月分（日ごと連打をやめる＝弾かれない）。
+        # 決算期は1ヶ月で5000件を超えるので、1回で切らずにページングで続きを取る
+        records = self._fetch_paged(f"{start}-{end}", year, month, 5000)
         # 重複除去
         seen, uniq = set(), []
         for r in records:
@@ -153,6 +154,17 @@ class YanoshinTDnetCollector:
                 seen.add(k); uniq.append(r)
         print(f" →{len(uniq)}件", flush=True)
         return uniq
+
+    def existing_count(self, year, month):
+        """S3 に既にある月ファイルの件数（無ければ 0）"""
+        if not self.s3:
+            return 0
+        try:
+            key = f"{self.s3_prefix}{year}-{month:02d}.json"
+            body = self.s3.get_object(Bucket=self.bucket_name, Key=key)['Body'].read()
+            return int(json.loads(body).get('total_disclosures') or 0)
+        except Exception:
+            return 0
 
     def save_to_s3(self, year, month, disclosures):
         if not self.s3:
@@ -196,6 +208,11 @@ class YanoshinTDnetCollector:
             print(f"[{idx}/{len(months)}] {y}/{m:02d}", end='', flush=True)
             try:
                 recs = self.fetch_month(y, m)
+                old = self.existing_count(y, m) if recs else 0
+                if recs and len(recs) < old * 0.9:
+                    # 取り直した件数が既存より1割以上少ない（APIに古い分が無い等）→ 既存を守るため上書きしない
+                    print(f" 既存{old:,}件より少ないため上書きしない", flush=True); ng += 1
+                    continue
                 if recs and self.save_to_s3(y, m, recs):
                     ok += 1; total += len(recs)
                 else:
