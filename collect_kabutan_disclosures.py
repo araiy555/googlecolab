@@ -134,6 +134,10 @@ class YanoshinTDnetCollector:
                 if rec:
                     out.append(rec); new += 1
             if new == 0:           # 新規が無い＝終端 or startが効かない
+                if len(items) >= limit:
+                    print(f" [警告:{query}は{limit}件で頭打ち・続きが取れない]", end='', flush=True)
+                break
+            if len(items) < limit:  # 上限より少ない＝最後のページ
                 break
             offset += len(items)   # 実件数で進める（limit上限が小さくても安全）
         return out
@@ -141,11 +145,12 @@ class YanoshinTDnetCollector:
     # ── 1ヶ月分 ──
     def fetch_month(self, year, month):
         last_day = calendar.monthrange(year, month)[1]
-        start = f"{year}{month:02d}01"
-        end   = f"{year}{month:02d}{last_day:02d}"
-        # 範囲クエリで1ヶ月分（日ごと連打をやめる＝弾かれない）。
-        # 決算期は1ヶ月で5000件を超えるので、1回で切らずにページングで続きを取る
-        records = self._fetch_paged(f"{start}-{end}", year, month, 5000)
+        # 1日ずつ取る。範囲クエリは1回5000件で頭打ちになり、start での続き取得も効かない
+        # （決算期は1ヶ月で1〜2万件あるので月の範囲クエリでは半分以上が抜ける）。
+        # 1日分は多い日でも5000件未満なので、1日1リクエストで全件取れる
+        records = []
+        for day in range(1, last_day + 1):
+            records += self._fetch_paged(f"{year}{month:02d}{day:02d}", year, month, 5000)
         # 重複除去
         seen, uniq = set(), []
         for r in records:
@@ -155,16 +160,38 @@ class YanoshinTDnetCollector:
         print(f" →{len(uniq)}件", flush=True)
         return uniq
 
-    def existing_count(self, year, month):
-        """S3 に既にある月ファイルの件数（無ければ 0）"""
+    def load_existing(self, year, month):
+        """S3 に既にある月ファイルの開示一覧（無ければ空）"""
         if not self.s3:
-            return 0
+            return []
         try:
             key = f"{self.s3_prefix}{year}-{month:02d}.json"
             body = self.s3.get_object(Bucket=self.bucket_name, Key=key)['Body'].read()
-            return int(json.loads(body).get('total_disclosures') or 0)
+            return json.loads(body).get('disclosures') or []
         except Exception:
-            return 0
+            return []
+
+    @staticmethod
+    def _merge_key(d):
+        title = ''.join(str(d.get('title') or '').split())   # 半角・全角スペースの違いは無視
+        return f"{d.get('stock_code')}_{d.get('date')}_{title}"
+
+    def merge(self, old, new):
+        """既存の開示は消さずに残し、同じ開示には時刻を足し、無い開示は追加する
+        （既存には株探由来の法定開示など TDnet に無いものも入っているため、置き換えはしない）"""
+        by_key = {self._merge_key(r): r for r in new}
+        used, out = set(), []
+        for d in old:
+            k = self._merge_key(d)
+            r = by_key.get(k)
+            if r is not None:
+                used.add(k)
+                if r.get('time') and not d.get('time'):
+                    d = dict(d, time=r['time'])
+            out.append(d)
+        out += [r for k, r in by_key.items() if k not in used]
+        out.sort(key=lambda d: (d.get('date') or '', d.get('time') or ''), reverse=True)
+        return out
 
     def save_to_s3(self, year, month, disclosures):
         if not self.s3:
@@ -208,11 +235,11 @@ class YanoshinTDnetCollector:
             print(f"[{idx}/{len(months)}] {y}/{m:02d}", end='', flush=True)
             try:
                 recs = self.fetch_month(y, m)
-                old = self.existing_count(y, m) if recs else 0
-                if recs and len(recs) < old * 0.9:
-                    # 取り直した件数が既存より1割以上少ない（APIに古い分が無い等）→ 既存を守るため上書きしない
-                    print(f" 既存{old:,}件より少ないため上書きしない", flush=True); ng += 1
-                    continue
+                if recs:
+                    old = self.load_existing(y, m)
+                    recs = self.merge(old, recs)
+                    timed = sum(1 for d in recs if d.get('time'))
+                    print(f" 既存{len(old):,}件と合わせて{len(recs):,}件（時刻あり{timed:,}件）", flush=True)
                 if recs and self.save_to_s3(y, m, recs):
                     ok += 1; total += len(recs)
                 else:
